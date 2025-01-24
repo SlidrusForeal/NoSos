@@ -8,14 +8,13 @@ import time
 import logging
 import queue
 import unicodedata
-import numpy as np
+from collections import deque
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler('monitor.log'), logging.StreamHandler()]
 )
-
 
 class SafeMonitor:
     def __init__(self):
@@ -81,9 +80,12 @@ class SafeMonitor:
                 "bins": 50,
                 "cmap": "hot",
                 "alpha": 0.3,
-                "show": False
+                "show": False,
+                "mode": "history",
+                "max_history": 10**6
             }
         }
+
 
     def setup_plot(self):
         plt.style.use('dark_background')
@@ -94,7 +96,7 @@ class SafeMonitor:
 
     def setup_controls(self):
         # Основные элементы управления
-        self.player_list_ax = self.fig.add_axes([0.72, 0.10, 0.25, 0.85])
+        self.player_list_ax = self.fig.add_axes([0.72, 0.15, 0.25, 0.80])
         self.player_list_ax.axis('off')
         self.player_list_text = self.player_list_ax.text(
             0.05, 0.95,
@@ -105,7 +107,7 @@ class SafeMonitor:
         )
 
         # Чекбокс для игроков
-        self.checkbox_ax = self.fig.add_axes([0.72, 0.05, 0.25, 0.04])
+        self.checkbox_ax = self.fig.add_axes([0.72, 0.10, 0.25, 0.04])
         self.player_checkboxes = CheckButtons(
             ax=self.checkbox_ax,
             labels=[],
@@ -113,22 +115,36 @@ class SafeMonitor:
         )
         self.player_checkboxes.on_clicked(self.update_filter)
 
-        # Чекбокс для тепловой карты
-        self.heatmap_checkbox_ax = self.fig.add_axes([0.72, 0.01, 0.25, 0.04])
+        # Управление heatmap
+        self.heatmap_control_ax = self.fig.add_axes([0.72, 0.01, 0.25, 0.08])
+        self.heatmap_control_ax.axis('off')
+
         self.heatmap_checkbox = CheckButtons(
-            ax=self.heatmap_checkbox_ax,
-            labels=['Показать тепловую карту'],
+            ax=self.fig.add_axes([0.73, 0.05, 0.1, 0.04]),
+            labels=['Тепловая карта'],
             actives=[self.config["heatmap"]["show"]]
         )
         self.heatmap_checkbox.on_clicked(self.toggle_heatmap)
 
+        self.heatmap_mode_checkbox = CheckButtons(
+            ax=self.fig.add_axes([0.73, 0.01, 0.2, 0.04]),
+            labels=['Режим истории'],
+            actives=[self.config["heatmap"]["mode"] == "history"]
+        )
+        self.heatmap_mode_checkbox.on_clicked(self.toggle_heatmap_mode)
+
     def toggle_heatmap(self, label):
         self.config["heatmap"]["show"] = not self.config["heatmap"]["show"]
         self.heatmap_checkbox.set_active([0] if self.config["heatmap"]["show"] else [])
-        self.gui_update_queue.put(lambda: None)
+
+    def toggle_heatmap_mode(self, label):
+        new_mode = "history" if self.config["heatmap"]["mode"] == "current" else "current"
+        self.config["heatmap"]["mode"] = new_mode
+        self.heatmap_mode_checkbox.set_active([0] if new_mode == "history" else [])
 
     def init_data_structures(self):
         self.current_data = []
+        self.historical_data = deque(maxlen=self.config["heatmap"]["max_history"])
         self.players_list = set()
         self.selected_players = set()
         self.data_lock = threading.Lock()
@@ -146,7 +162,6 @@ class SafeMonitor:
                 "triggered": False
             } for zone in self.config["alerts"]["zones"]
         ])
-
     def start_data_thread(self):
         self.data_thread = threading.Thread(target=self.data_worker, daemon=True)
         self.data_thread.start()
@@ -169,6 +184,11 @@ class SafeMonitor:
                 filtered_players = [p for p in all_players if not p.get('foreign', False)]
                 with self.data_lock:
                     self.current_data = filtered_players
+                    # Сохраняем исторические данные
+                    self.historical_data.extend(
+                        [(p["position"]["x"], p["position"]["z"])
+                         for p in filtered_players]
+                    )
                     self.gui_update_queue.put(lambda: self.update_players_list(filtered_players))
         except Exception as e:
             logging.error(f"Fetch error: {str(e)}")
@@ -267,13 +287,22 @@ class SafeMonitor:
 
     def draw_heatmap(self):
         try:
-            if not self.current_data:
+            if not self.historical_data and not self.current_data:
                 return
 
-            x = [p["position"]["x"] for p in self.current_data]
-            z = [p["position"]["z"] for p in self.current_data]
-
             heatmap_config = self.config["heatmap"]
+
+            if heatmap_config["mode"] == "history":
+                data = list(self.historical_data)
+            else:
+                data = [(p["position"]["x"], p["position"]["z"])
+                        for p in self.current_data]
+
+            if not data:
+                return
+
+            x, z = zip(*data)
+
             self.ax.hist2d(
                 x, z,
                 bins=heatmap_config["bins"],
@@ -296,7 +325,6 @@ class SafeMonitor:
 
             self.ax.clear()
 
-            # Отрисовка тепловой карты
             if self.config["heatmap"]["show"]:
                 self.draw_heatmap()
 
