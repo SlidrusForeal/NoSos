@@ -9,12 +9,15 @@ import logging
 import queue
 import unicodedata
 from collections import deque
+import os
+import pickle
 
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[logging.FileHandler('monitor.log'), logging.StreamHandler()]
 )
+
 
 class SafeMonitor:
     def __init__(self):
@@ -23,13 +26,15 @@ class SafeMonitor:
         self.gui_update_queue = queue.Queue()
         self.setup_plot()
         self.init_data_structures()
+        self.load_history()
         self.start_data_thread()
 
     def load_config(self):
         return {
             "players_url": "https://map.serverchichi.online/maps/world/live/players.json",
             "world_bounds": {"xmin": -10145, "xmax": 10145, "zmin": -10078, "zmax": 10078},
-            "update_interval": 5,
+            "update_interval": 15,
+            "min_request_interval": 5,
             "display": {
                 "point_size": 25,
                 "point_color": "#00FF00",
@@ -49,28 +54,11 @@ class SafeMonitor:
                         "name": "Сосмарк",
                         "bounds": {"xmin": 4124, "xmax": 5291, "zmin": -3465, "zmax": -2225},
                         "allowed_players": [
-                            "K1zik",
-                            "Kwakich",
-                            "_DeN41k_",
-                            "Bruno_Hempf",
-                            "Sanplay11",
-                            "Panzergrenadier",
-                            "napacoJlbka",
-                            "Amoliper",
-                            "Chestz",
-                            "BotEnot",
-                            "_mixailchert_",
-                            "VuLo4ka",
-                            "Aphgust",
-                            "Sir_Bred",
-                            "Timondarck",
-                            "italianopelmen",
-                            "KomJys",
-                            "BaBiEdA",
-                            "poshelyanaher",
-                            "Peridotik",
-                            "_ChesTer_aD",
-                            "RockVandal"
+                            "K1zik", "Kwakich", "_DeN41k_", "Bruno_Hempf", "Sanplay11",
+                            "Panzergrenadier", "napacoJlbka", "Amoliper", "Chestz",
+                            "BotEnot", "_mixailchert_", "VuLo4ka", "Aphgust", "Sir_Bred",
+                            "Timondarck", "italianopelmen", "KomJys", "BaBiEdA",
+                            "poshelyanaher", "Peridotik", "_ChesTer_aD", "RockVandal"
                         ]
                     }
                 ],
@@ -82,10 +70,10 @@ class SafeMonitor:
                 "alpha": 0.3,
                 "show": False,
                 "mode": "history",
-                "max_history": 10**6
+                "max_history": 10 ** 6,
+                "history_file": "heatmap_history.pkl"
             }
         }
-
 
     def setup_plot(self):
         plt.style.use('dark_background')
@@ -99,48 +87,49 @@ class SafeMonitor:
         self.player_list_ax = self.fig.add_axes([0.72, 0.15, 0.25, 0.80])
         self.player_list_ax.axis('off')
         self.player_list_text = self.player_list_ax.text(
-            0.05, 0.95,
-            "Обновление...",
-            fontfamily='monospace',
-            verticalalignment='top',
-            color='white'
+            0.05, 0.95, "Обновление...", fontfamily='monospace',
+            verticalalignment='top', color='white'
         )
 
         # Чекбокс для игроков
         self.checkbox_ax = self.fig.add_axes([0.72, 0.10, 0.25, 0.04])
-        self.player_checkboxes = CheckButtons(
-            ax=self.checkbox_ax,
-            labels=[],
-            actives=[]
-        )
+        self.player_checkboxes = CheckButtons(self.checkbox_ax, [], [])
         self.player_checkboxes.on_clicked(self.update_filter)
 
         # Управление heatmap
         self.heatmap_control_ax = self.fig.add_axes([0.72, 0.01, 0.25, 0.08])
         self.heatmap_control_ax.axis('off')
 
+        # Чекбокс отображения heatmap
         self.heatmap_checkbox = CheckButtons(
-            ax=self.fig.add_axes([0.73, 0.05, 0.1, 0.04]),
-            labels=['Тепловая карта'],
-            actives=[self.config["heatmap"]["show"]]
+            self.fig.add_axes([0.73, 0.05, 0.1, 0.04]),
+            ['Тепловая карта'],
+            [self.config["heatmap"]["show"]]
         )
-        self.heatmap_checkbox.on_clicked(self.toggle_heatmap)
+        self.heatmap_cid = self.heatmap_checkbox.on_clicked(self.toggle_heatmap)
 
+        # Чекбокс режима heatmap
         self.heatmap_mode_checkbox = CheckButtons(
-            ax=self.fig.add_axes([0.73, 0.01, 0.2, 0.04]),
-            labels=['Режим истории'],
-            actives=[self.config["heatmap"]["mode"] == "history"]
+            self.fig.add_axes([0.73, 0.01, 0.2, 0.04]),
+            ['Режим истории'],
+            [self.config["heatmap"]["mode"] == "history"]
         )
-        self.heatmap_mode_checkbox.on_clicked(self.toggle_heatmap_mode)
+        self.heatmap_mode_cid = self.heatmap_mode_checkbox.on_clicked(self.toggle_heatmap_mode)
 
     def toggle_heatmap(self, label):
-        self.config["heatmap"]["show"] = not self.config["heatmap"]["show"]
-        self.heatmap_checkbox.set_active([0] if self.config["heatmap"]["show"] else [])
+        if isinstance(label, str):
+            self.config["heatmap"]["show"] = not self.config["heatmap"]["show"]
+            self.heatmap_checkbox.disconnect(self.heatmap_cid)
+            self.heatmap_checkbox.set_active([0] if self.config["heatmap"]["show"] else [])
+            self.heatmap_cid = self.heatmap_checkbox.on_clicked(self.toggle_heatmap)
 
     def toggle_heatmap_mode(self, label):
-        new_mode = "history" if self.config["heatmap"]["mode"] == "current" else "current"
-        self.config["heatmap"]["mode"] = new_mode
-        self.heatmap_mode_checkbox.set_active([0] if new_mode == "history" else [])
+        if isinstance(label, str):
+            new_mode = "history" if self.config["heatmap"]["mode"] == "current" else "current"
+            self.config["heatmap"]["mode"] = new_mode
+            self.heatmap_mode_checkbox.disconnect(self.heatmap_mode_cid)
+            self.heatmap_mode_checkbox.set_active([0] if new_mode == "history" else [])
+            self.heatmap_mode_cid = self.heatmap_mode_checkbox.on_clicked(self.toggle_heatmap_mode)
 
     def init_data_structures(self):
         self.current_data = []
@@ -154,14 +143,13 @@ class SafeMonitor:
         self.label_objects = []
 
     def setup_alerts(self):
-        self.alerts.extend([
-            {
-                "type": "zone",
-                "zone": zone["name"],
-                "bounds": zone["bounds"],
-                "triggered": False
-            } for zone in self.config["alerts"]["zones"]
-        ])
+        self.alerts.extend([{
+            "type": "zone",
+            "zone": zone["name"],
+            "bounds": zone["bounds"],
+            "triggered": False
+        } for zone in self.config["alerts"]["zones"]])
+
     def start_data_thread(self):
         self.data_thread = threading.Thread(target=self.data_worker, daemon=True)
         self.data_thread.start()
@@ -172,9 +160,18 @@ class SafeMonitor:
                 start_time = time.perf_counter()
                 self.fetch_and_process_data()
                 self.check_alerts()
-                time.sleep(max(0, self.config["update_interval"] - (time.perf_counter() - start_time)))
+
+                # Рассчёт оставшегося времени с защитой от слишком частых запросов
+                elapsed = time.perf_counter() - start_time
+                sleep_time = max(
+                    self.config["min_request_interval"],
+                    self.config["update_interval"] - elapsed
+                )
+
+                time.sleep(sleep_time)
             except Exception as e:
                 logging.error(f"Data thread error: {str(e)}")
+                time.sleep(self.config["update_interval"])  # Защитная задержка при ошибках
 
     def fetch_and_process_data(self):
         try:
@@ -184,14 +181,33 @@ class SafeMonitor:
                 filtered_players = [p for p in all_players if not p.get('foreign', False)]
                 with self.data_lock:
                     self.current_data = filtered_players
-                    # Сохраняем исторические данные
                     self.historical_data.extend(
-                        [(p["position"]["x"], p["position"]["z"])
-                         for p in filtered_players]
+                        [(p["position"]["x"], p["position"]["z"]) for p in filtered_players]
                     )
                     self.gui_update_queue.put(lambda: self.update_players_list(filtered_players))
         except Exception as e:
             logging.error(f"Fetch error: {str(e)}")
+
+    def save_history(self):
+        try:
+            with self.data_lock:
+                history = list(self.historical_data)
+            with open(self.config["heatmap"]["history_file"], 'wb') as f:
+                pickle.dump(history, f)
+            logging.info(f"Сохранено {len(history)} записей истории")
+        except Exception as e:
+            logging.error(f"Ошибка сохранения истории: {str(e)}")
+
+    def load_history(self):
+        try:
+            if os.path.exists(self.config["heatmap"]["history_file"]):
+                with open(self.config["heatmap"]["history_file"], 'rb') as f:
+                    history = pickle.load(f)
+                with self.data_lock:
+                    self.historical_data.extend(history)
+                logging.info(f"Загружено {len(history)} исторических записей")
+        except Exception as e:
+            logging.error(f"Ошибка загрузки истории: {str(e)}")
 
     def update_players_list(self, players):
         new_players = {p["name"] for p in players} - self.players_list
@@ -410,9 +426,10 @@ class SafeMonitor:
 
     def run(self):
         try:
+            # Увеличиваем интервал обновления GUI до 2 секунд
             ani = FuncAnimation(
                 self.fig, self.update_plot,
-                interval=1000,
+                interval=2000,  # Было 1000
                 cache_frame_data=False
             )
             plt.show()
@@ -421,6 +438,7 @@ class SafeMonitor:
 
     def shutdown(self):
         self.stop_event.set()
+        self.save_history()  # Сохранение истории перед выходом
         plt.close('all')
 
 
