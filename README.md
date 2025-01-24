@@ -30,7 +30,6 @@ pip install -r requirements.txt
 python monitor.py
 ```
 
-```markdown
 ## Конфигурация
 
 Конфигурация хранится в методе `load_config()`. Основные параметры:
