@@ -8,6 +8,7 @@ import time
 import logging
 import queue
 import unicodedata
+import numpy as np
 
 logging.basicConfig(
     level=logging.INFO,
@@ -44,6 +45,7 @@ class SafeMonitor:
             },
             "alerts": {
                 "zones": [
+                    {"name": "Спавн", "bounds": {"xmin": -500, "xmax": 500, "zmin": -500, "zmax": 500}},
                     {
                         "name": "Сосмарк",
                         "bounds": {"xmin": 4124, "xmax": 5291, "zmin": -3465, "zmax": -2225},
@@ -74,6 +76,12 @@ class SafeMonitor:
                     }
                 ],
                 "max_players": 50
+            },
+            "heatmap": {
+                "bins": 50,
+                "cmap": "hot",
+                "alpha": 0.3,
+                "show": False
             }
         }
 
@@ -85,7 +93,8 @@ class SafeMonitor:
         self.setup_controls()
 
     def setup_controls(self):
-        self.player_list_ax = self.fig.add_axes([0.72, 0.05, 0.25, 0.9])
+        # Основные элементы управления
+        self.player_list_ax = self.fig.add_axes([0.72, 0.10, 0.25, 0.85])
         self.player_list_ax.axis('off')
         self.player_list_text = self.player_list_ax.text(
             0.05, 0.95,
@@ -95,13 +104,28 @@ class SafeMonitor:
             color='white'
         )
 
-        self.checkbox_ax = self.fig.add_axes([0.72, 0.01, 0.25, 0.04])
+        # Чекбокс для игроков
+        self.checkbox_ax = self.fig.add_axes([0.72, 0.05, 0.25, 0.04])
         self.player_checkboxes = CheckButtons(
             ax=self.checkbox_ax,
             labels=[],
             actives=[]
         )
         self.player_checkboxes.on_clicked(self.update_filter)
+
+        # Чекбокс для тепловой карты
+        self.heatmap_checkbox_ax = self.fig.add_axes([0.72, 0.01, 0.25, 0.04])
+        self.heatmap_checkbox = CheckButtons(
+            ax=self.heatmap_checkbox_ax,
+            labels=['Показать тепловую карту'],
+            actives=[self.config["heatmap"]["show"]]
+        )
+        self.heatmap_checkbox.on_clicked(self.toggle_heatmap)
+
+    def toggle_heatmap(self, label):
+        self.config["heatmap"]["show"] = not self.config["heatmap"]["show"]
+        self.heatmap_checkbox.set_active([0] if self.config["heatmap"]["show"] else [])
+        self.gui_update_queue.put(lambda: None)
 
     def init_data_structures(self):
         self.current_data = []
@@ -241,6 +265,29 @@ class SafeMonitor:
         plt.pause(3)
         self.ax.texts[-1].remove()
 
+    def draw_heatmap(self):
+        try:
+            if not self.current_data:
+                return
+
+            x = [p["position"]["x"] for p in self.current_data]
+            z = [p["position"]["z"] for p in self.current_data]
+
+            heatmap_config = self.config["heatmap"]
+            self.ax.hist2d(
+                x, z,
+                bins=heatmap_config["bins"],
+                cmap=heatmap_config["cmap"],
+                alpha=heatmap_config["alpha"],
+                zorder=-1,
+                range=[
+                    [self.config["world_bounds"]["xmin"], self.config["world_bounds"]["xmax"]],
+                    [self.config["world_bounds"]["zmin"], self.config["world_bounds"]["zmax"]]
+                ]
+            )
+        except Exception as e:
+            logging.error(f"Heatmap error: {str(e)}")
+
     def update_plot(self, frame):
         try:
             while not self.gui_update_queue.empty():
@@ -248,6 +295,11 @@ class SafeMonitor:
                 update_func()
 
             self.ax.clear()
+
+            # Отрисовка тепловой карты
+            if self.config["heatmap"]["show"]:
+                self.draw_heatmap()
+
             self.draw_players()
             self.draw_zones()
             self.setup_labels()
@@ -272,7 +324,8 @@ class SafeMonitor:
                 s=self.config["display"]["point_size"],
                 c=self.config["display"]["point_color"],
                 alpha=self.config["display"]["point_alpha"],
-                edgecolors='none'
+                edgecolors='none',
+                zorder=10
             )
 
             label_config = self.config["display"]["labels"]
@@ -291,7 +344,8 @@ class SafeMonitor:
                         facecolor=label_config["bg_color"],
                         edgecolor='none',
                         alpha=label_config["bg_alpha"]
-                    )
+                    ),
+                    zorder=11
                 )
                 self.label_objects.append(text)
 
@@ -301,9 +355,13 @@ class SafeMonitor:
             zmin, zmax = zone["bounds"]["zmin"], zone["bounds"]["zmax"]
             self.ax.add_patch(plt.Rectangle(
                 (xmin, zmin), xmax - xmin, zmax - zmin,
-                fill=False, edgecolor='red', linestyle='--', linewidth=1
+                fill=False, edgecolor='red', linestyle='--', linewidth=1,
+                zorder=10
             ))
-            self.ax.text(xmin + 50, zmin + 50, zone["name"], color='red')
+            self.ax.text(
+                xmin + 50, zmin + 50, zone["name"],
+                color='red', zorder=11
+            )
 
     def setup_labels(self):
         self.ax.set_xlim(self.config["world_bounds"]["xmin"], self.config["world_bounds"]["xmax"])
