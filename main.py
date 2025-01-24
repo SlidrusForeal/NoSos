@@ -19,7 +19,7 @@ logging.basicConfig(
 )
 
 
-class SafeMonitor:
+class NoSos:
     def __init__(self):
         self.config = self.load_config()
         self.alert_queue = queue.Queue()
@@ -443,5 +443,5 @@ class SafeMonitor:
 
 
 if __name__ == "__main__":
-    monitor = SafeMonitor()
+    monitor = NoSos()
     monitor.run()
