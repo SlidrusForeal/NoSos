@@ -14,7 +14,7 @@ from functools import lru_cache
 from abc import ABC, abstractmethod
 from enum import Enum, auto
 from dataclasses import dataclass
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Tuple, Optional
 import yaml
 
 logging.basicConfig(
@@ -59,7 +59,91 @@ class BaseAlertRule(ABC):
     def _update_cooldown(self, identifier: str):
         self.last_triggered[identifier] = time.time()
 
+class MovementAnomalyRule(BaseAlertRule):
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.max_speed = config.get("max_speed", 50)  # Блоков в секунду
+        self.teleport_threshold = config.get("teleport_threshold", 100)
+        self.player_positions: Dict[str, Tuple[Tuple[float, float], float]] = {}  # История позиций игроков
 
+    def check_conditions(self, data: Dict) -> List[Alert]:
+        alerts = []
+        current_time = time.time()
+
+        for player in data.get("players", []):
+            try:
+                player_id = player["uuid"]
+                current_pos = (player["position"]["x"], player["position"]["z"])
+                last_pos, last_time = self._get_player_history(player_id)
+
+                if last_pos is None:
+                    self._update_player_history(player_id, current_pos, current_time)
+                    continue
+
+                # Рассчет расстояния и времени
+                distance = self._calculate_distance(last_pos, current_pos)
+                time_diff = current_time - last_time
+
+                # Проверка на аномалии
+                if time_diff > 0:
+                    speed = distance / time_diff
+                    if speed > self.max_speed:
+                        if distance > self.teleport_threshold:
+                            alert = self._create_teleport_alert(player, distance)
+                        else:
+                            alert = self._create_speed_alert(player, speed)
+
+                        if self._should_trigger(alert.message):
+                            alerts.append(alert)
+                            self._update_cooldown(alert.message)
+
+                self._update_player_history(player_id, current_pos, current_time)
+
+            except Exception as e:
+                logging.error(f"Ошибка обработки игрока {player.get('name')}: {str(e)}")
+
+        return alerts
+
+    def _get_player_history(self, player_id: str) -> Tuple[Optional[Tuple[float, float]], float]:
+        """Получение последней зафиксированной позиции игрока"""
+        return self.player_positions.get(player_id, (None, 0.0))
+
+    def _update_player_history(self, player_id: str, pos: Tuple[float, float], timestamp: float):
+        """Обновление истории позиций игрока"""
+        self.player_positions[player_id] = (pos, timestamp)
+
+    def _calculate_distance(self, pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
+        """Расчет расстояния между двумя точками"""
+        return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
+
+    def _create_speed_alert(self, player: Dict, speed: float) -> Alert:
+        """Генерация алерта о превышении скорости"""
+        return Alert(
+            message=f"Игрок {player['name']} движется со скоростью {speed:.1f} блоков/сек",
+            level=self.alert_level,
+            source="movement_anomaly",
+            timestamp=datetime.now(),
+            metadata={
+                "player": player['name'],
+                "speed": speed,
+                "position": player["position"]
+            }
+        )
+
+    def _create_teleport_alert(self, player: Dict, distance: float) -> Alert:
+        """Генерация алерта о возможном телепорте"""
+        return Alert(
+            message=f"Игрок {player['name']} переместился на {distance:.1f} блоков мгновенно",
+            level=AlertLevel.CRITICAL,
+            source="teleport_detection",
+            timestamp=datetime.now(),
+            metadata={
+                "player": player['name'],
+                "distance": distance,
+                "from": self._get_player_history(player["uuid"])[0],
+                "to": player["position"]
+            }
+        )
 class ZoneIntrusionRule(BaseAlertRule):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -146,7 +230,8 @@ class AlertManager:
     def load_rules_from_config(self, config: Dict):
         rule_registry = {
             "zone_intrusion": ZoneIntrusionRule,
-            "player_limit": PlayerCountRule
+            "player_limit": PlayerCountRule,
+            "movement_anomaly": MovementAnomalyRule  # Новое правило
         }
 
         for rule_config in config.get("zones", []):
@@ -154,6 +239,9 @@ class AlertManager:
 
         if "limits" in config:
             self.rules.append(rule_registry["player_limit"](config["limits"]))
+
+        if "movement_anomaly" in config:  # Загрузка нового правила
+            self.rules.append(rule_registry["movement_anomaly"](config["movement_anomaly"]))
 
     def process_data(self, data: Dict):
         new_alerts = []
