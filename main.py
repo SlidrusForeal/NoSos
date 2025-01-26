@@ -1,13 +1,13 @@
 import requests
 import matplotlib.pyplot as plt
 from matplotlib.animation import FuncAnimation
-from datetime import datetime
+from datetime import datetime, timedelta
 import threading
 import time
 import logging
 import queue
 import unicodedata
-from collections import deque
+from collections import defaultdict, deque
 import os
 import pickle
 from functools import lru_cache
@@ -16,6 +16,10 @@ from enum import Enum, auto
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple, Optional
 import yaml
+import csv
+import json
+import sqlite3
+import pandas as pd
 
 logging.basicConfig(
     level=logging.INFO,
@@ -58,6 +62,7 @@ class BaseAlertRule(ABC):
 
     def _update_cooldown(self, identifier: str):
         self.last_triggered[identifier] = time.time()
+
 
 class MovementAnomalyRule(BaseAlertRule):
     def __init__(self, config: Dict[str, Any]):
@@ -144,6 +149,8 @@ class MovementAnomalyRule(BaseAlertRule):
                 "to": player["position"]
             }
         )
+
+
 class ZoneIntrusionRule(BaseAlertRule):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
@@ -231,7 +238,7 @@ class AlertManager:
         rule_registry = {
             "zone_intrusion": ZoneIntrusionRule,
             "player_limit": PlayerCountRule,
-            "movement_anomaly": MovementAnomalyRule  # Новое правило
+            "movement_anomaly": MovementAnomalyRule
         }
 
         for rule_config in config.get("zones", []):
@@ -240,7 +247,7 @@ class AlertManager:
         if "limits" in config:
             self.rules.append(rule_registry["player_limit"](config["limits"]))
 
-        if "movement_anomaly" in config:  # Загрузка нового правила
+        if "movement_anomaly" in config:
             self.rules.append(rule_registry["movement_anomaly"](config["movement_anomaly"]))
 
     def process_data(self, data: Dict):
@@ -261,7 +268,7 @@ class AlertManager:
     def _clean_expired_alerts(self):
         expire_time = time.time() - 3600
         to_remove = [aid for aid, alert in self.active_alerts.items()
-                    if alert.timestamp.timestamp() < expire_time]
+                     if alert.timestamp.timestamp() < expire_time]
         for aid in to_remove:
             del self.active_alerts[aid]
 
@@ -278,13 +285,24 @@ class NoSos:
             self.config["world_bounds"]["zmin"],
             self.config["world_bounds"]["zmax"]
         )
+        self.config.setdefault('database', {'filename': 'activity.db'})
+        self.config.setdefault('language', 'ru')
+        self.config.setdefault('themes', {'default': 'dark'})
+
+        # Инициализация недостающих атрибутов
+        self.label_objects = []
+        self.db_queue = queue.Queue()
         self.gui_update_queue = queue.Queue()
+
         self.alert_manager = AlertManager()
         self.setup_plot()
         self.init_data_structures()
+        self.init_db()
         self.load_history()
         self.setup_alerts()
         self.start_data_thread()
+        self.start_db_handler()
+        self.load_translations()
 
     def load_config(self):
         with open('config.yaml', 'r', encoding='utf-8') as f:
@@ -317,11 +335,109 @@ class NoSos:
         )
 
     def init_data_structures(self):
+        # Основные структуры данных
         self.current_data = []
         self.historical_data = deque(maxlen=self.config["heatmap"]["max_history"])
         self.data_lock = threading.Lock()
         self.stop_event = threading.Event()
-        self.label_objects = []
+
+        # Новая статистика
+        self.activity_by_hour = defaultdict(int)
+        self.player_time = defaultdict(float)
+        self.zone_time = defaultdict(lambda: defaultdict(float))
+        self.last_update_time = time.time()
+
+        # Кэш для ускорения обработки
+        self.zone_cache = {}
+
+    def init_db(self):
+        db_config = self.config['database']
+        filename = db_config.get('filename', 'activity.db')
+        self.conn = sqlite3.connect(filename, check_same_thread=False)
+        self.create_tables()
+
+
+    def start_db_handler(self):
+        def db_handler():
+            while not self.stop_event.is_set():
+                try:
+                    task = self.db_queue.get(timeout=1)
+                    if task:
+                        task()
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    logging.error(f"DB handler error: {str(e)}")
+
+        threading.Thread(target=db_handler, daemon=True).start()
+
+    # В методе save_to_db заменяем работу с датами
+    def save_to_db(self):
+        def db_task():
+            try:
+                cursor = self.conn.cursor()
+                now = datetime.now().date().isoformat()  # Преобразуем дату в строку ISO 8601
+                current_hour = datetime.now().hour
+
+                # Сохранение активности игроков
+                for player, total_time in self.player_time.items():
+                    cursor.execute('''
+                        INSERT INTO activity (player, time, hour, date)
+                        VALUES (?, ?, ?, ?)
+                    ''', (player, total_time, current_hour, now))
+
+                # Сохранение времени в зонах
+                for zone, players in self.zone_time.items():
+                    for player, time_spent in players.items():
+                        cursor.execute('''
+                            INSERT INTO zones (player, zone, time, date)
+                            VALUES (?, ?, ?, ?)
+                        ''', (player, zone, time_spent, now))
+
+                self.conn.commit()
+            except Exception as e:
+                logging.error(f"Database error: {str(e)}")
+
+        self.db_queue.put(db_task)
+
+    def create_tables(self):
+        try:
+            cursor = self.conn.cursor()
+            # Убираем комментарии внутри SQL-запросов
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS activity (
+                    player TEXT,
+                    time REAL,
+                    hour INTEGER,
+                    date TEXT
+                )
+            ''')
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS zones (
+                    player TEXT,
+                    zone TEXT,
+                    time REAL,
+                    date TEXT
+                )
+            ''')
+            self.conn.commit()
+        except sqlite3.Error as e:
+            logging.error(f"Database error: {str(e)}")
+
+    def load_translations(self):
+        self.translations = {
+            "en": {
+                "welcome": "Welcome",
+                "players_online": "Players Online (Overworld):",
+                "alert": "Alert"
+            },
+            "ru": {
+                "welcome": "Добро пожаловать",
+                "players_online": "Онлайн игроки (Оверворлд):",
+                "alert": "Оповещение"
+            }
+        }
+        self.language = self.config.get("language", "ru")
 
     def setup_alerts(self):
         self.alert_manager.load_rules_from_config(self.config["alerts"])
@@ -337,22 +453,83 @@ class NoSos:
     def data_worker(self):
         while not self.stop_event.is_set():
             try:
-                start_time = time.perf_counter()
+                start_time = time.time()
                 self.fetch_and_process_data()
+                self.update_statistics()
+                self.save_to_db()
 
-                with self.data_lock:
-                    data = {"players": self.current_data}
-                    self.alert_manager.process_data(data)
-
-                elapsed = time.perf_counter() - start_time
+                elapsed = time.time() - start_time
                 sleep_time = max(
                     self.config["min_request_interval"],
                     self.config["update_interval"] - elapsed
                 )
                 time.sleep(sleep_time)
             except Exception as e:
-                logging.error(f"Ошибка потока данных: {str(e)}")
-                time.sleep(self.config["update_interval"])
+                logging.error(f"Data worker error: {str(e)}")
+
+    def update_statistics(self):
+        now = datetime.now()
+        current_hour = now.hour
+
+        with self.data_lock:
+            # Обновление статистики активности
+            self.activity_by_hour[current_hour] += len(self.current_data)
+
+            # Обновление времени игроков
+            time_diff = time.time() - self.last_update_time
+            for player in self.current_data:
+                name = player['name']
+                self.player_time[name] += time_diff
+                self.process_zone_time(player, time_diff)
+
+            self.last_update_time = time.time()
+
+    def process_zone_time(self, player, time_diff):
+        pos = player.get("position", {})
+        x, z = pos.get("x", 0), pos.get("z", 0)
+
+        for zone in self.config["alerts"]["zones"]:
+            zone_name = zone["name"]
+            if self.is_in_zone(x, z, zone):
+                self.zone_time[zone_name][player['name']] += time_diff
+                break
+
+    def is_in_zone(self, x, z, zone):
+        cache_key = (x, z, zone['name'])
+        if cache_key in self.zone_cache:
+            return self.zone_cache[cache_key]
+
+        in_zone = (
+                zone["bounds"]["xmin"] <= x <= zone["bounds"]["xmax"] and
+                zone["bounds"]["zmin"] <= z <= zone["bounds"]["zmax"]
+        )
+        self.zone_cache[cache_key] = in_zone
+        return in_zone
+
+    def save_to_db(self):
+        try:
+            cursor = self.conn.cursor()
+            now = datetime.now().date()
+            current_hour = datetime.now().hour
+
+            # Сохранение активности
+            for player, total_time in self.player_time.items():
+                cursor.execute('''
+                    INSERT INTO activity (player, time, hour, date)
+                    VALUES (?, ?, ?, ?)
+                ''', (player, total_time, current_hour, now))
+
+            # Сохранение времени в зонах
+            for zone, players in self.zone_time.items():
+                for player, time_spent in players.items():
+                    cursor.execute('''
+                        INSERT INTO zones (player, zone, time, date)
+                        VALUES (?, ?, ?, ?)
+                    ''', (player, zone, time_spent, now))
+
+            self.conn.commit()
+        except Exception as e:
+            logging.error(f"Database error: {str(e)}")
 
     @lru_cache(maxsize=32)
     def fetch_data(self):
@@ -430,6 +607,7 @@ class NoSos:
             [self.world_bounds[0], self.world_bounds[1]],
             [self.world_bounds[2], self.world_bounds[3]]
         ]
+
     def draw_heatmap(self):
         try:
             if not self.historical_data or len(self.historical_data) < 10:
@@ -456,16 +634,19 @@ class NoSos:
 
     def update_plot(self, frame):
         try:
+            # Обработка задач БД в основном потоке
+            while not self.db_queue.empty():
+                task = self.db_queue.get()
+                if task:
+                    task()
+
+            self.ax.clear()
+            self.label_objects = []  # Сбрасываем метки каждый кадр
+
+            # Остальная логика отрисовки
             while not self.gui_update_queue.empty():
                 update_func = self.gui_update_queue.get()
                 update_func()
-
-            self.ax.clear()
-
-            for label in self.label_objects:
-                if label in self.ax.texts:
-                    self.ax.texts.remove(label)
-            self.label_objects.clear()
 
             if len(self.historical_data) >= 10:
                 self.draw_heatmap()
@@ -480,7 +661,6 @@ class NoSos:
         except Exception as e:
             logging.error(f"Ошибка обновления графика: {str(e)}")
             return self.ax
-
     def draw_players(self):
         with self.data_lock:
             filtered = self.current_data
@@ -572,10 +752,128 @@ class NoSos:
         finally:
             self.shutdown()
 
+    def translate(self, key):
+        return self.translations[self.language].get(key, key)
+
+    def set_theme(self, theme_name=None):
+        theme_name = theme_name or self.config['themes'].get('default', 'dark')
+        themes = {
+            'dark': {'background': 'black', 'text': 'white'},
+            'light': {'background': 'white', 'text': 'black'},
+            'blue': {'background': '#002b36', 'text': '#839496'}
+        }
+
+        theme = themes.get(theme_name, themes['dark'])
+        plt.style.use({'axes.facecolor': theme['background'],
+                       'text.color': theme['text']})
+        if hasattr(self, 'fig'):
+            self.fig.set_facecolor(theme['background'])
+            self.ax.set_facecolor(theme['background'])
+            self.fig.canvas.draw_idle()
+
+    def get_top_players(self, top_n=10):
+        return sorted(self.player_time.items(),
+                     key=lambda x: x[1], reverse=True)[:top_n]
+
+    def get_zone_statistics(self):
+        stats = {}
+        for zone, players in self.zone_time.items():
+            stats[zone] = sum(players.values())
+        return stats
+
+
+    def plot_activity_by_hour(self):
+        hours = list(range(24))
+        counts = [self.activity_by_hour.get(h, 0) for h in hours]
+
+        plt.figure(figsize=(10, 6))
+        plt.bar(hours, counts, color='blue')
+        plt.xlabel(self.translate('hour'))
+        plt.ylabel(self.translate('activity'))
+        plt.title(self.translate('activity_by_hour'))
+        plt.xticks(hours)
+        plt.grid(True)
+        plt.show()
+
+    def export_data(self, format='csv'):
+        try:
+            if format == 'csv':
+                self.export_to_csv()
+            elif format == 'json':
+                self.export_to_json()
+            elif format == 'excel':
+                self.export_to_excel()
+            elif format == 'player_zone_time':
+                self.export_player_zone_time()  # Новый метод для экспорта времени игроков в зонах
+        except Exception as e:
+            logging.error(f"Export error: {str(e)}")
+
+    def export_player_zone_time(self):
+        """Экспорт данных о времени, проведенном игроками в зонах."""
+        try:
+            player_zone_time = []
+            for zone, players in self.zone_time.items():
+                for player, time_spent in players.items():
+                    player_zone_time.append([player, zone, round(time_spent, 2)])
+
+            # Запись в CSV
+            with open('player_zone_time.csv', 'w', newline='', encoding='utf-8') as f:
+                writer = csv.writer(f)
+                writer.writerow(['Player', 'Zone', 'Time Spent (seconds)'])
+                writer.writerows(player_zone_time)
+
+            logging.info("Данные о времени игроков в зонах успешно экспортированы в player_zone_time.csv")
+        except Exception as e:
+            logging.error(f"Ошибка экспорта времени игроков в зонах: {str(e)}")
+
+    def export_to_csv(self):
+        # Экспорт активности игроков
+        with open('player_activity.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Player', 'Total Time'])
+            for player, time in self.player_time.items():
+                writer.writerow([player, time])
+
+        # Экспорт статистики по зонам
+        with open('zone_stats.csv', 'w', newline='') as f:
+            writer = csv.writer(f)
+            writer.writerow(['Zone', 'Total Time'])
+            for zone, time in self.get_zone_statistics().items():
+                writer.writerow([zone, time])
+
+    def export_to_json(self):
+        data = {
+            'player_activity': dict(self.player_time),
+            'zone_stats': self.get_zone_statistics()
+        }
+        with open('stats.json', 'w') as f:
+            json.dump(data, f, indent=2)
+
+    def export_to_excel(self):
+        df1 = pd.DataFrame(list(self.player_time.items()),
+                           columns=['Player', 'Total Time'])
+        df2 = pd.DataFrame(list(self.get_zone_statistics().items()),
+                           columns=['Zone', 'Total Time'])
+
+        with pd.ExcelWriter('stats.xlsx') as writer:
+            df1.to_excel(writer, sheet_name='Player Activity', index=False)
+            df2.to_excel(writer, sheet_name='Zone Stats', index=False)
+
     def shutdown(self):
+        # Дожидаемся завершения задач БД
+        while not self.db_queue.empty():
+            task = self.db_queue.get()
+            if task:
+                task()
+
+        # Закрываем соединение
+        if hasattr(self, 'conn'):
+            self.conn.close()
+
+        # Остальная логика завершения...
         self.stop_event.set()
-        self.save_history()
         plt.close('all')
+        self.export_data()
 
     def save_history(self):
         try:
