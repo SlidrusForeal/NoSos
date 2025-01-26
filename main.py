@@ -1,186 +1,261 @@
-# Импорт необходимых библиотек
-import requests  # Для выполнения HTTP-запросов
-import matplotlib.pyplot as plt  # Для создания визуализации
-from matplotlib.animation import FuncAnimation  # Для анимации графика
-from matplotlib.widgets import CheckButtons  # Для чекбоксов управления
-from datetime import datetime  # Для работы с временными метками
-import threading  # Для работы с потоками
-import time  # Для работы с задержками
-import logging  # Для логирования событий
-import queue  # Для организации очередей между потоками
-import unicodedata  # Для нормализации строк
-from collections import deque  # Для работы с историей позиций
-import os  # Для работы с файловой системой
-import pickle  # Для сохранения и загрузки истории
+import requests
+import matplotlib.pyplot as plt
+from matplotlib.animation import FuncAnimation
+from datetime import datetime
+import threading
+import time
+import logging
+import queue
+import unicodedata
+from collections import deque
+import os
+import pickle
+from functools import lru_cache
+from abc import ABC, abstractmethod
+from enum import Enum, auto
+from dataclasses import dataclass
+from typing import Dict, Any, List
+import yaml
 
-# Настройка системы логирования
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('monitor.log'),  # Запись логов в файл
-        logging.StreamHandler()  # Вывод логов в консоль
+        logging.FileHandler('monitor.log'),
+        logging.StreamHandler()
     ]
 )
 
-class NoSos:
-    def __init__(self):
-        """Инициализация основного класса монитора."""
-        self.config = self.load_config()  # Загрузка конфигурации
-        self.alert_queue = queue.Queue()  # Очередь для оповещений
-        self.gui_update_queue = queue.Queue()  # Очередь для обновления GUI
-        self.setup_plot()  # Настройка графического интерфейса
-        self.init_data_structures()  # Инициализация структур данных
-        self.load_history()  # Загрузка истории тепловой карты
-        self.start_data_thread()  # Запуск потока сбора данных
 
-    def load_config(self):
-        """Загрузка конфигурации приложения."""
-        return {
-            "players_url": "https://map.serverchichi.online/maps/world/live/players.json",
-            "world_bounds": {  # Границы игрового мира
-                "xmin": -10145, 
-                "xmax": 10145, 
-                "zmin": -10078, 
-                "zmax": 10078
-            },
-            "update_interval": 15,  # Интервал обновления данных (секунды)
-            "min_request_interval": 5,  # Минимальный интервал между запросами
-            "display": {  # Настройки отображения
-                "point_size": 25,  # Размер точек игроков
-                "point_color": "#00FF00",  # Цвет точек
-                "point_alpha": 0.7,  # Прозрачность точек
-                "labels": {  # Настройки подписей
-                    "font_size": 8,
-                    "text_color": "#FFFF00",
-                    "bg_color": "#000000",
-                    "bg_alpha": 0.5,
-                    "y_offset": 8  # Смещение подписи относительно точки
-                }
-            },
-            "alerts": {  # Настройки системы оповещений
-                "zones": [  # Контролируемые зоны
-                    {
-                        "name": "Спавн",
-                        "bounds": {"xmin": -500, "xmax": 500, "zmin": -500, "zmax": 500}
-                    },
-                    {
-                        "name": "Сосмарк",
-                        "bounds": {"xmin": 4124, "xmax": 5291, "zmin": -3465, "zmax": -2225},
-                        "allowed_players": [  # Белый список игроков
-                            "K1zik", "Kwakich", "_DeN41k_", "Bruno_Hempf", "Sanplay11",
-                            "Panzergrenadier", "napacoJlbka", "Amoliper", "Chestz",
-                            "BotEnot", "_mixailchert_", "VuLo4ka", "Aphgust", "Sir_Bred",
-                            "Timondarck", "italianopelmen", "KomJys", "BaBiEdA",
-                            "poshelyanaher", "Peridotik", "_ChesTer_aD", "RockVandal"
-                        ]
-                    }
-                ],
-                "max_players": 50  # Максимальное количество игроков без предупреждения
-            },
-            "heatmap": {  # Настройки тепловой карты
-                "bins": 50,  # Количество секторов
-                "cmap": "hot",  # Цветовая схема
-                "alpha": 0.3,  # Прозрачность
-                "show": False,  # Показывать по умолчанию
-                "mode": "history",  # Режим отображения (history/current)
-                "max_history": 10**6,  # Максимальный размер истории
-                "history_file": "heatmap_history.pkl"  # Файл для сохранения истории
+class AlertLevel(Enum):
+    INFO = auto()
+    WARNING = auto()
+    CRITICAL = auto()
+
+
+@dataclass(frozen=True)
+class Alert:
+    message: str
+    level: AlertLevel
+    source: str
+    timestamp: datetime
+    metadata: Dict[str, Any] = None
+
+
+class BaseAlertRule(ABC):
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.cooldown = config.get("cooldown", 60)
+        self.last_triggered: Dict[str, float] = {}
+        self.alert_level = config.get("alert_level", AlertLevel.WARNING)
+
+    @abstractmethod
+    def check_conditions(self, data: Dict) -> List[Alert]:
+        pass
+
+    def _should_trigger(self, identifier: str) -> bool:
+        return (time.time() - self.last_triggered.get(identifier, 0)) > self.cooldown
+
+    def _update_cooldown(self, identifier: str):
+        self.last_triggered[identifier] = time.time()
+
+
+class ZoneIntrusionRule(BaseAlertRule):
+    def __init__(self, config: Dict[str, Any]):
+        super().__init__(config)
+        self.excluded = config.get("excluded", False)
+
+    @staticmethod
+    @lru_cache(maxsize=1000)
+    def _normalize_name(name: str) -> str:
+        return unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode().lower()
+
+    @lru_cache(maxsize=500)
+    def _in_zone(self, x: float, z: float) -> bool:
+        bounds = self.config["bounds"]
+        return (bounds["xmin"] <= x <= bounds["xmax"] and
+                bounds["zmin"] <= z <= bounds["zmax"])
+
+    def check_conditions(self, data: Dict) -> List[Alert]:
+        if self.excluded:
+            return []
+
+        alerts = []
+        zone_name = self.config["name"]
+        allowed = {self._normalize_name(p) for p in self.config.get("allowed_players", [])}
+
+        for player in data.get("players", []):
+            pos = player.get("position", {})
+            x, z = pos.get("x", 0), pos.get("z", 0)
+
+            if not self._in_zone(x, z):
+                continue
+
+            norm_name = self._normalize_name(player.get("name", ""))
+            if norm_name in allowed:
+                continue
+
+            alert_id = f"{zone_name}_{norm_name}"
+            if self._should_trigger(alert_id):
+                alerts.append(self._create_alert(player, zone_name, x, z))
+                self._update_cooldown(alert_id)
+
+        return alerts
+
+    def _create_alert(self, player: Dict, zone_name: str, x: float, z: float) -> Alert:
+        return Alert(
+            message=f"Игрок {player.get('name', 'Unknown')} в зоне {zone_name}",
+            level=self.alert_level,
+            source="zone_intrusion",
+            timestamp=datetime.now(),
+            metadata={
+                "player": player.get('name'),
+                "zone": zone_name,
+                "coordinates": (x, z)
             }
+        )
+
+
+class PlayerCountRule(BaseAlertRule):
+    def check_conditions(self, data: Dict) -> List[Alert]:
+        current = len(data.get("players", []))
+        max_players = self.config.get("max_players", 50)
+        return [Alert(
+            message=f"Превышен лимит игроков: {current}/{max_players}",
+            level=AlertLevel.CRITICAL,
+            source="player_limit",
+            timestamp=datetime.now(),
+            metadata={"current": current, "max": max_players}
+        )] if current > max_players else []
+
+
+class AlertManager:
+    def __init__(self):
+        self.rules: List[BaseAlertRule] = []
+        self.active_alerts: Dict[str, Alert] = {}
+        self.alert_history = deque(maxlen=1000)
+
+    def get_active_alerts(self) -> List[Alert]:
+        """Возвращает список активных алертов"""
+        return list(self.active_alerts.values())
+
+    @lru_cache(maxsize=100)
+    def _generate_alert_id(self, source: str, message: str) -> str:
+        return f"{source}_{hash(message)}"
+
+    def load_rules_from_config(self, config: Dict):
+        rule_registry = {
+            "zone_intrusion": ZoneIntrusionRule,
+            "player_limit": PlayerCountRule
         }
 
+        for rule_config in config.get("zones", []):
+            self.rules.append(rule_registry["zone_intrusion"](rule_config))
+
+        if "limits" in config:
+            self.rules.append(rule_registry["player_limit"](config["limits"]))
+
+    def process_data(self, data: Dict):
+        new_alerts = []
+        for rule in self.rules:
+            try:
+                new_alerts.extend(rule.check_conditions(data))
+            except Exception as e:
+                logging.error(f"Ошибка в правиле {rule.__class__.__name__}: {str(e)}")
+
+        for alert in new_alerts:
+            alert_id = self._generate_alert_id(alert.source, alert.message)
+            self.active_alerts[alert_id] = alert
+            self.alert_history.append(alert)
+
+        self._clean_expired_alerts()
+
+    def _clean_expired_alerts(self):
+        expire_time = time.time() - 3600
+        to_remove = [aid for aid, alert in self.active_alerts.items()
+                    if alert.timestamp.timestamp() < expire_time]
+        for aid in to_remove:
+            del self.active_alerts[aid]
+
+    def get_alert_history(self, limit=50) -> List[Alert]:
+        return list(self.alert_history)[-limit:]
+
+
+class NoSos:
+    def __init__(self):
+        self.config = self.load_config()
+        self.world_bounds = (
+            self.config["world_bounds"]["xmin"],
+            self.config["world_bounds"]["xmax"],
+            self.config["world_bounds"]["zmin"],
+            self.config["world_bounds"]["zmax"]
+        )
+        self.gui_update_queue = queue.Queue()
+        self.alert_manager = AlertManager()
+        self.setup_plot()
+        self.init_data_structures()
+        self.load_history()
+        self.setup_alerts()
+        self.start_data_thread()
+
+    def load_config(self):
+        with open('config.yaml', 'r', encoding='utf-8') as f:
+            config = yaml.safe_load(f)
+
+        for zone in config['alerts']['zones']:
+            zone['alert_level'] = AlertLevel[zone.get('alert_level', 'INFO')]
+
+        if 'limits' in config['alerts']:
+            config['alerts']['limits']['alert_level'] = AlertLevel[config['alerts']['limits']['alert_level']]
+
+        return config
+
     def setup_plot(self):
-        """Настройка графического интерфейса."""
-        plt.style.use('dark_background')  # Темная тема
-        self.fig = plt.figure(figsize=(16, 10))  # Создание фигуры
-        self.ax = self.fig.add_subplot(111)  # Основные оси для карты
-        self.fig.subplots_adjust(right=0.7, left=0.05)  # Настройка расположения
-        self.setup_controls()  # Добавление элементов управления
+        plt.style.use('dark_background')
+        self.fig = plt.figure(figsize=(16, 10))
+        self.ax = self.fig.add_subplot(111)
+        self.fig.subplots_adjust(right=0.7, left=0.05)
+        self.setup_controls()
 
     def setup_controls(self):
-        """Создание элементов управления."""
-        # Область для списка игроков
-        self.player_list_ax = self.fig.add_axes([0.72, 0.15, 0.25, 0.80])
+        self.player_list_ax = self.fig.add_axes([0.72, 0.25, 0.25, 0.70])
         self.player_list_ax.axis('off')
         self.player_list_text = self.player_list_ax.text(
-            0.05, 0.95, "Обновление...", 
+            0.05, 0.95, "Обновление...",
             fontfamily='monospace',
-            verticalalignment='top', 
-            color='white'
+            verticalalignment='top',
+            color='white',
+            fontsize=9
         )
-
-        # Чекбоксы для фильтрации игроков
-        self.checkbox_ax = self.fig.add_axes([0.72, 0.10, 0.25, 0.04])
-        self.player_checkboxes = CheckButtons(self.checkbox_ax, [], [])
-        self.player_checkboxes.on_clicked(self.update_filter)
-
-        # Элементы управления тепловой картой
-        self.heatmap_control_ax = self.fig.add_axes([0.72, 0.01, 0.25, 0.08])
-        self.heatmap_control_ax.axis('off')
-
-        # Чекбокс отображения тепловой карты
-        self.heatmap_checkbox = CheckButtons(
-            self.fig.add_axes([0.73, 0.05, 0.1, 0.04]),
-            ['Тепловая карта'],
-            [self.config["heatmap"]["show"]]
-        )
-        self.heatmap_cid = self.heatmap_checkbox.on_clicked(self.toggle_heatmap)
-
-        # Переключатель режима тепловой карты
-        self.heatmap_mode_checkbox = CheckButtons(
-            self.fig.add_axes([0.73, 0.01, 0.2, 0.04]),
-            ['Режим истории'],
-            [self.config["heatmap"]["mode"] == "history"]
-        )
-        self.heatmap_mode_cid = self.heatmap_mode_checkbox.on_clicked(self.toggle_heatmap_mode)
-
-    def toggle_heatmap(self, label):
-        """Переключение отображения тепловой карты."""
-        self.config["heatmap"]["show"] = not self.config["heatmap"]["show"]
-        self.heatmap_checkbox.set_active([0] if self.config["heatmap"]["show"] else [])
-
-    def toggle_heatmap_mode(self, label):
-        """Переключение режима тепловой карты между текущими и историческими данными."""
-        new_mode = "history" if self.config["heatmap"]["mode"] == "current" else "current"
-        self.config["heatmap"]["mode"] = new_mode
-        self.heatmap_mode_checkbox.set_active([0] if new_mode == "history" else [])
 
     def init_data_structures(self):
-        """Инициализация структур данных."""
-        self.current_data = []  # Текущие данные о позициях
-        self.historical_data = deque(maxlen=self.config["heatmap"]["max_history"])  # История позиций
-        self.players_list = set()  # Список всех игроков
-        self.selected_players = set()  # Выбранные для отображения игроки
-        self.data_lock = threading.Lock()  # Блокировка для потокобезопасности
-        self.stop_event = threading.Event()  # Событие для остановки потока
-        self.alerts = []  # Список активных оповещений
-        self.setup_alerts()  # Инициализация системы оповещений
-        self.label_objects = []  # Графические элементы подписей
+        self.current_data = []
+        self.historical_data = deque(maxlen=self.config["heatmap"]["max_history"])
+        self.data_lock = threading.Lock()
+        self.stop_event = threading.Event()
+        self.label_objects = []
 
     def setup_alerts(self):
-        """Инициализация системы оповещений для зон."""
-        for zone in self.config["alerts"]["zones"]:
-            self.alerts.append({
-                "type": "zone",
-                "zone": zone["name"],
-                "bounds": zone["bounds"],
-                "triggered": False  # Флаг срабатывания
-            })
+        self.alert_manager.load_rules_from_config(self.config["alerts"])
 
     def start_data_thread(self):
-        """Запуск потока для сбора данных."""
-        self.data_thread = threading.Thread(target=self.data_worker, daemon=True)
+        self.data_thread = threading.Thread(
+            target=self.data_worker,
+            daemon=True,
+            name="DataWorkerThread"
+        )
         self.data_thread.start()
 
     def data_worker(self):
-        """Основной цикл потока сбора данных."""
         while not self.stop_event.is_set():
             try:
                 start_time = time.perf_counter()
-                self.fetch_and_process_data()  # Получение и обработка данных
-                self.check_alerts()  # Проверка условий для оповещений
+                self.fetch_and_process_data()
 
-                # Расчет времени до следующего обновления
+                with self.data_lock:
+                    data = {"players": self.current_data}
+                    self.alert_manager.process_data(data)
+
                 elapsed = time.perf_counter() - start_time
                 sleep_time = max(
                     self.config["min_request_interval"],
@@ -188,290 +263,153 @@ class NoSos:
                 )
                 time.sleep(sleep_time)
             except Exception as e:
-                logging.error(f"Ошибка в потоке данных: {str(e)}")
+                logging.error(f"Ошибка потока данных: {str(e)}")
                 time.sleep(self.config["update_interval"])
 
-    def fetch_and_process_data(self):
-        """Получение и обработка данных с сервера."""
+    @lru_cache(maxsize=32)
+    def fetch_data(self):
         try:
             response = requests.get(self.config["players_url"], timeout=10)
             if response.status_code == 200:
-                # Фильтрация данных
-                all_players = response.json().get("players", [])
-                filtered_players = [p for p in all_players if not p.get('foreign', False)]
-                
-                with self.data_lock:
-                    self.current_data = filtered_players
-                    # Сохранение в историю
-                    self.historical_data.extend(
-                        [(p["position"]["x"], p["position"]["z"]) for p in filtered_players]
-                    )
-                    # Обновление GUI
-                    self.gui_update_queue.put(lambda: self.update_players_list(filtered_players))
+                return response.json().get("players", [])
+            return []
         except Exception as e:
             logging.error(f"Ошибка получения данных: {str(e)}")
+            return []
 
-    def save_history(self):
-        """Сохранение истории позиций в файл."""
+    def fetch_and_process_data(self):
         try:
+            all_players = self.fetch_data()
+            filtered_players = [p for p in all_players if not p.get('foreign', False)]
+
             with self.data_lock:
-                history = list(self.historical_data)
-            with open(self.config["heatmap"]["history_file"], 'wb') as f:
-                pickle.dump(history, f)
-            logging.info(f"Сохранено {len(history)} записей истории")
+                self.current_data = filtered_players
+                self.historical_data.extend(
+                    [(p["position"]["x"], p["position"]["z"]) for p in filtered_players]
+                )
+                self.gui_update_queue.put(self.update_player_list_text)
+
+            self.fetch_data.cache_clear()
+
         except Exception as e:
-            logging.error(f"Ошибка сохранения истории: {str(e)}")
-
-    def load_history(self):
-        """Загрузка истории позиций из файла."""
-        try:
-            if os.path.exists(self.config["heatmap"]["history_file"]):
-                with open(self.config["heatmap"]["history_file"], 'rb') as f:
-                    history = pickle.load(f)
-                with self.data_lock:
-                    self.historical_data.extend(history)
-                logging.info(f"Загружено {len(history)} исторических записей")
-        except Exception as e:
-            logging.error(f"Ошибка загрузки истории: {str(e)}")
-
-    def update_players_list(self, players):
-        """
-        Обновление списка игроков в боковой панели.
-        Добавляет новых игроков в чекбоксы фильтрации.
-        """
-        # Находим новых игроков, которых еще нет в текущем списке
-        new_players = {p["name"] for p in players} - self.players_list
-        
-        if new_players:
-            # Обновляем основной список игроков
-            self.players_list.update(new_players)
-            
-            # Добавляем новых игроков в элементы управления
-            for p in new_players:
-                self.player_checkboxes.labels.append(plt.Text(0, 0, p))
-            
-            # Перерисовываем интерфейс
-            self.fig.canvas.draw_idle()
-
-    def update_filter(self, label):
-        """
-        Обработчик изменения состояния чекбоксов.
-        Обновляет список выбранных для отображения игроков.
-        """
-        if label in self.selected_players:
-            self.selected_players.remove(label)
-        else:
-            self.selected_players.add(label)
-
-    def check_alerts(self):
-        """
-        Проверка всех условий для срабатывания оповещений.
-        """
-        with self.data_lock:
-            # Получаем текущие данные о позициях игроков
-            current_players = {p["name"] for p in self.current_data}
-            positions = {p["name"]: (p["position"]["x"], p["position"]["z"]) for p in self.current_data}
-
-        alerts_to_show = []
-        # Проверяем все зарегистрированные оповещения
-        for alert in self.alerts:
-            if alert["type"] == "zone":
-                result = self.check_zone_alert(alert, positions)
-                if result: 
-                    alerts_to_show.append(result)
-
-        # Проверка на превышение максимального числа игроков
-        if len(self.current_data) > self.config["alerts"]["max_players"]:
-            alerts_to_show.append(f"Players limit exceeded: {len(self.current_data)}")
-
-        # Помещаем все оповещения в очередь обработки
-        for alert in alerts_to_show:
-            self.alert_queue.put(alert)
-
-    def normalize_name(self, name: str) -> str:
-        """
-        Нормализация имени игрока для сравнения.
-        Удаляет диакритические знаки и приводит к нижнему регистру.
-        """
-        cleaned = unicodedata.normalize('NFKD', name)
-        cleaned = cleaned.encode('ascii', 'ignore').decode()
-        return cleaned.strip().lower()
-
-    def check_zone_alert(self, alert, positions):
-        """
-        Проверка конкретной зоны на наличие неавторизованных игроков.
-        Возвращает сообщение об оповещении при обнаружении нарушения.
-        """
-        zone_name = alert["zone"]
-        try:
-            # Получаем конфигурацию зоны из настроек
-            zone_config = next(z for z in self.config["alerts"]["zones"] if z["name"] == zone_name)
-        except StopIteration:
-            logging.error(f"Конфигурация зоны не найдена: {zone_name}")
-            return None
-
-        # Подготавливаем белый список игроков для этой зоны
-        allowed_players = set(self.normalize_name(p) for p in zone_config.get("allowed_players", []))
-        logging.info(f"Проверка зоны {zone_name}. Игнорируемые игроки: {allowed_players}")
-
-        # Проверяем всех игроков в текущих позициях
-        for name, (x, z) in positions.items():
-            clean_name = self.normalize_name(name)
-
-            # Получаем границы зоны
-            bounds = alert["bounds"]
-            in_zone = (
-                bounds["xmin"] <= x <= bounds["xmax"] and
-                bounds["zmin"] <= z <= bounds["zmax"]
-            )
-
-            if not in_zone:
-                continue  # Игрок вне зоны, пропускаем
-
-            # Специальная обработка для зоны "Сосмарк"
-            if zone_name == "Сосмарк":
-                if clean_name in allowed_players:
-                    logging.info(f"Игрок {name} ({clean_name}) в белом списке, пропуск")
-                    continue  # Игрок в белом списке, пропускаем
-
-            # Если оповещение еще не срабатывало
-            if not alert["triggered"]:
-                alert["triggered"] = True
-                logging.warning(f"Срабатывание алерта для {name} в {zone_name}")
-                return f"Player {name} in {alert['zone']}"
-
-        # Сбрасываем флаг срабатывания если нарушителей нет
-        alert["triggered"] = False
-        return None
+            logging.error(f"Ошибка обработки данных: {str(e)}")
 
     def process_alerts(self):
-        """
-        Обработка очереди оповещений.
-        Выводит сообщения в лог и на график.
-        """
-        while not self.alert_queue.empty():
-            alert = self.alert_queue.get()
-            logging.warning(f"ALERT: {alert}")
+        for alert in self.alert_manager.get_active_alerts():
             self.show_alert(alert)
+            logging.warning(f"АКТИВНЫЙ АЛЕРТ: {alert.message}")
 
-    def show_alert(self, message):
-        """
-        Визуальное отображение оповещения на графике.
-        Сообщение показывается в течение 3 секунд.
-        """
-        # Создаем временную аннотацию
-        self.ax.annotate(
-            f"! {message} !",
-            xy=(0.5, 1.02),  # Позиция в верхней части графика
-            xycoords='axes fraction',
-            color='red',
-            fontsize=12,
-            ha='center',
-            bbox=dict(boxstyle='round', facecolor='white', alpha=0.5)
-        )
-        
-        # Принудительная перерисовка и задержка
-        plt.draw()
-        plt.pause(3)
-        
-        # Удаление сообщения после показа
-        if self.ax.texts:
-            self.ax.texts[-1].remove()
-
-    def draw_heatmap(self):
-        """
-        Отрисовка тепловой карты активности игроков.
-        Может использовать как текущие, так и исторические данные.
-        """
+    def show_alert(self, alert: Alert):
         try:
-            # Проверка наличия данных для отрисовки
-            if not self.historical_data and not self.current_data:
+            color_map = {
+                AlertLevel.INFO: '#FFFF00',
+                AlertLevel.WARNING: '#FFA500',
+                AlertLevel.CRITICAL: '#FF2222'
+            }
+
+            alert_text = self.ax.text(
+                0.5,
+                1.02,
+                f"⚠ {alert.message} ⚠",
+                transform=self.ax.transAxes,
+                color=color_map[alert.level],
+                fontsize=14,
+                ha='center',
+                va='bottom',
+                bbox=dict(
+                    boxstyle='round',
+                    facecolor='#330000',
+                    edgecolor=color_map[alert.level],
+                    linewidth=2
+                ),
+                zorder=100,
+                alpha=0.9
+            )
+
+            def remove_alert():
+                if alert_text in self.ax.texts:
+                    alert_text.remove()
+                    self.fig.canvas.draw_idle()
+
+            threading.Timer(5.0, remove_alert).start()
+            self.fig.canvas.draw_idle()
+
+        except Exception as e:
+            logging.error(f"Ошибка отображения алерта: {str(e)}")
+
+    def get_heatmap_bins(self):
+        return [
+            [self.world_bounds[0], self.world_bounds[1]],
+            [self.world_bounds[2], self.world_bounds[3]]
+        ]
+    def draw_heatmap(self):
+        try:
+            if not self.historical_data or len(self.historical_data) < 10:
                 return
 
-            heatmap_config = self.config["heatmap"]
+            x, z = zip(*self.historical_data)
+            x = [xi for xi in x if self.world_bounds[0] <= xi <= self.world_bounds[1]]
+            z = [zi for zi in z if self.world_bounds[2] <= zi <= self.world_bounds[3]]
 
-            # Выбор источника данных в зависимости от режима
-            if heatmap_config["mode"] == "history":
-                data = list(self.historical_data)
-            else:
-                data = [(p["position"]["x"], p["position"]["z"]) for p in self.current_data]
-
-            if not data:
+            if not x or not z:
                 return
 
-            # Подготовка координат
-            x, z = zip(*data)
-
-            # Создание 2D гистограммы
             self.ax.hist2d(
                 x, z,
-                bins=heatmap_config["bins"],
-                cmap=heatmap_config["cmap"],
-                alpha=heatmap_config["alpha"],
-                zorder=-1,  # Отрисовывается под другими элементами
-                range=[
-                    [self.config["world_bounds"]["xmin"], self.config["world_bounds"]["xmax"]],
-                    [self.config["world_bounds"]["zmin"], self.config["world_bounds"]["zmax"]]
-                ]
+                bins=self.config["heatmap"]["bins"],
+                cmap=self.config["heatmap"]["cmap"],
+                alpha=self.config["heatmap"]["alpha"],
+                zorder=-1,
+                range=self.get_heatmap_bins(),
+                density=True
             )
         except Exception as e:
-            logging.error(f"Heatmap error: {str(e)}")
+            logging.error(f"Ошибка тепловой карты: {str(e)}")
 
     def update_plot(self, frame):
-        """
-        Основная функция обновления графика.
-        Вызывается периодически для анимации.
-        """
         try:
-            # Обработка очереди обновлений GUI
             while not self.gui_update_queue.empty():
                 update_func = self.gui_update_queue.get()
                 update_func()
 
-            # Очистка предыдущего состояния
             self.ax.clear()
 
-            # Отрисовка тепловой карты если включена
-            if self.config["heatmap"]["show"]:
+            for label in self.label_objects:
+                if label in self.ax.texts:
+                    self.ax.texts.remove(label)
+            self.label_objects.clear()
+
+            if len(self.historical_data) >= 10:
                 self.draw_heatmap()
 
-            # Последовательная отрисовка элементов
-            self.draw_players()
             self.draw_zones()
+            self.draw_players()
             self.setup_labels()
             self.update_player_list_text()
             self.process_alerts()
-            
+
             return self.ax
         except Exception as e:
-            logging.error(f"Plot error: {str(e)}")
+            logging.error(f"Ошибка обновления графика: {str(e)}")
             return self.ax
 
     def draw_players(self):
-        """
-        Отрисовка игроков на карте с учетом фильтров.
-        """
         with self.data_lock:
-            # Фильтрация игроков по выбранным в чекбоксах
-            filtered = [p for p in self.current_data 
-                       if not self.selected_players or p["name"] in self.selected_players]
+            filtered = self.current_data
 
         if filtered:
-            # Подготовка координат
             x = [p["position"]["x"] for p in filtered]
             z = [p["position"]["z"] for p in filtered]
 
-            # Отрисовка точек игроков
             self.ax.scatter(
                 x, z,
                 s=self.config["display"]["point_size"],
                 c=self.config["display"]["point_color"],
                 alpha=self.config["display"]["point_alpha"],
                 edgecolors='none',
-                zorder=10  # Отрисовывается поверх тепловой карты
+                zorder=10
             )
 
-            # Добавление подписей к игрокам
             label_config = self.config["display"]["labels"]
             for player in filtered:
                 text = self.ax.annotate(
@@ -489,79 +427,57 @@ class NoSos:
                         edgecolor='none',
                         alpha=label_config["bg_alpha"]
                     ),
-                    zorder=11  # Отрисовывается поверх точек
+                    zorder=11
                 )
                 self.label_objects.append(text)
 
     def draw_zones(self):
-        """
-        Отрисовка контролируемых зон на карте.
-        """
         for zone in self.config["alerts"]["zones"]:
-            # Получение границ зоны
             xmin, xmax = zone["bounds"]["xmin"], zone["bounds"]["xmax"]
             zmin, zmax = zone["bounds"]["zmin"], zone["bounds"]["zmax"]
-            
-            # Отрисовка прямоугольника зоны
+
+            edgecolor = 'gray' if zone.get("excluded") else 'red'
+            linestyle = ':' if zone.get("excluded") else '--'
+
             self.ax.add_patch(plt.Rectangle(
                 (xmin, zmin), xmax - xmin, zmax - zmin,
-                fill=False, 
-                edgecolor='red', 
-                linestyle='--', 
+                fill=False,
+                edgecolor=edgecolor,
+                linestyle=linestyle,
                 linewidth=1,
-                zorder=10  # Отрисовывается поверх тепловой карты
+                zorder=9
             ))
-            
-            # Добавление названия зоны
             self.ax.text(
-                xmin + 50,  # Смещение от угла
-                zmin + 50,
-                zone["name"],
-                color='red', 
-                zorder=11  # Отрисовывается поверх других элементов
+                xmin + 50, zmin + 50,
+                f"{zone['name']} {'(excluded)' if zone.get('excluded') else ''}",
+                color=edgecolor,
+                zorder=11,
+                fontsize=8
             )
 
     def setup_labels(self):
-        """
-        Настройка осей и заголовка графика.
-        """
-        # Установка границ отображения
-        self.ax.set_xlim(self.config["world_bounds"]["xmin"], self.config["world_bounds"]["xmax"])
-        self.ax.set_ylim(self.config["world_bounds"]["zmin"], self.config["world_bounds"]["zmax"])
-        
-        # Обновление заголовка с текущим временем
-        self.ax.set_title(
-            f"Player Activity Map ({datetime.now().strftime('%H:%M:%S')})", 
-            color='white'
-        )
-        
-        # Настройка сетки
-        self.ax.grid(color='#30363d', linestyle='--')
+        self.ax.set_xlim(self.world_bounds[0], self.world_bounds[1])
+        self.ax.set_ylim(self.world_bounds[2], self.world_bounds[3])
+        self.ax.set_title(f"Карта активности игроков ({datetime.now().strftime('%H:%M:%S')})",
+                          color='white', fontsize=12, pad=20)
+        self.ax.grid(color='#404040', linestyle='--', linewidth=0.7)
 
     def update_player_list_text(self):
-        """
-        Обновление текста в боковой панели со списком игроков.
-        """
         with self.data_lock:
-            # Сортировка игроков по имени
             players = sorted(self.current_data, key=lambda x: x['name'])
-            text_lines = ["Online Players (Overworld):\n"]
-            
-            # Формирование строк с информацией о позициях
+            text_lines = ["Онлайн игроки (Оверворлд):\n"]
             for player in players:
                 x = int(player['position']['x'])
                 z = int(player['position']['z'])
                 text_lines.append(f"{player['name']: <20} X: {x: >6} Z: {z: >6}")
 
-            # Обновление текстового элемента
             self.player_list_text.set_text("\n".join(text_lines))
 
     def run(self):
-        """Основной цикл приложения."""
         try:
             ani = FuncAnimation(
                 self.fig, self.update_plot,
-                interval=2000,  # Интервал обновления GUI
+                interval=2000,
                 cache_frame_data=False
             )
             plt.show()
@@ -569,10 +485,31 @@ class NoSos:
             self.shutdown()
 
     def shutdown(self):
-        """Корректное завершение работы."""
         self.stop_event.set()
         self.save_history()
         plt.close('all')
+
+    def save_history(self):
+        try:
+            with self.data_lock:
+                history = list(self.historical_data)
+            with open(self.config["heatmap"]["history_file"], 'wb') as f:
+                pickle.dump(history, f)
+            logging.info(f"Сохранено записей истории: {len(history)}")
+        except Exception as e:
+            logging.error(f"Ошибка сохранения истории: {str(e)}")
+
+    def load_history(self):
+        try:
+            if os.path.exists(self.config["heatmap"]["history_file"]):
+                with open(self.config["heatmap"]["history_file"], 'rb') as f:
+                    history = pickle.load(f)
+                with self.data_lock:
+                    self.historical_data.extend(history)
+                logging.info(f"Загружено записей истории: {len(history)}")
+        except Exception as e:
+            logging.error(f"Ошибка загрузки истории: {str(e)}")
+
 
 if __name__ == "__main__":
     monitor = NoSos()
