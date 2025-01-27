@@ -1,25 +1,26 @@
-import requests
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
-from datetime import datetime, timedelta
-import threading
-import time
-import logging
-import queue
-import unicodedata
-from collections import defaultdict, deque
-import os
-import pickle
-from functools import lru_cache
-from abc import ABC, abstractmethod
-from enum import Enum, auto
-from dataclasses import dataclass
-from typing import Dict, Any, List, Tuple, Optional
-import yaml
 import csv
 import json
+import logging
+import os
+import pickle
+import queue
 import sqlite3
+import threading
+import time
+from abc import ABC, abstractmethod
+from collections import defaultdict, deque
+from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum, auto
+from functools import lru_cache
+from typing import Dict, Any, List, Tuple, Optional
+
+import matplotlib.pyplot as plt
 import pandas as pd
+import requests
+import unicodedata
+import yaml
+from matplotlib.animation import FuncAnimation
 
 logging.basicConfig(
     level=logging.INFO,
@@ -117,7 +118,8 @@ class MovementAnomalyRule(BaseAlertRule):
         """Обновление истории позиций игрока"""
         self.player_positions[player_id] = (pos, timestamp)
 
-    def _calculate_distance(self, pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
+    @staticmethod
+    def _calculate_distance(pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
         """Расчет расстояния между двумя точками"""
         return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
 
@@ -289,10 +291,11 @@ class NoSos:
         self.config.setdefault('language', 'ru')
         self.config.setdefault('themes', {'default': 'dark'})
 
-        # Инициализация недостающих атрибутов
         self.label_objects = []
         self.db_queue = queue.Queue()
         self.gui_update_queue = queue.Queue()
+        self.gui_queue = queue.Queue()
+        self.alert_texts = []
 
         self.alert_manager = AlertManager()
         self.setup_plot()
@@ -304,7 +307,9 @@ class NoSos:
         self.start_db_handler()
         self.load_translations()
 
-    def load_config(self):
+
+    @staticmethod
+    def load_config():
         with open('config.yaml', 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
 
@@ -506,31 +511,6 @@ class NoSos:
         self.zone_cache[cache_key] = in_zone
         return in_zone
 
-    def save_to_db(self):
-        try:
-            cursor = self.conn.cursor()
-            now = datetime.now().date()
-            current_hour = datetime.now().hour
-
-            # Сохранение активности
-            for player, total_time in self.player_time.items():
-                cursor.execute('''
-                    INSERT INTO activity (player, time, hour, date)
-                    VALUES (?, ?, ?, ?)
-                ''', (player, total_time, current_hour, now))
-
-            # Сохранение времени в зонах
-            for zone, players in self.zone_time.items():
-                for player, time_spent in players.items():
-                    cursor.execute('''
-                        INSERT INTO zones (player, zone, time, date)
-                        VALUES (?, ?, ?, ?)
-                    ''', (player, zone, time_spent, now))
-
-            self.conn.commit()
-        except Exception as e:
-            logging.error(f"Database error: {str(e)}")
-
     @lru_cache(maxsize=32)
     def fetch_data(self):
         try:
@@ -553,6 +533,9 @@ class NoSos:
                     [(p["position"]["x"], p["position"]["z"]) for p in filtered_players]
                 )
                 self.gui_update_queue.put(self.update_player_list_text)
+
+            # Передача данных в AlertManager для проверки алертов
+            self.alert_manager.process_data({"players": filtered_players})  # <-- Добавлено
 
             self.fetch_data.cache_clear()
 
@@ -590,14 +573,16 @@ class NoSos:
                 zorder=100,
                 alpha=0.9
             )
+            self.alert_texts.append(alert_text)
 
-            def remove_alert():
+            # Добавляем задачу удаления в очередь GUI
+            def remove_task():
                 if alert_text in self.ax.texts:
                     alert_text.remove()
+                    self.alert_texts.remove(alert_text)
                     self.fig.canvas.draw_idle()
 
-            threading.Timer(5.0, remove_alert).start()
-            self.fig.canvas.draw_idle()
+            self.gui_queue.put((remove_task, time.time() + 5.0))
 
         except Exception as e:
             logging.error(f"Ошибка отображения алерта: {str(e)}")
@@ -634,16 +619,27 @@ class NoSos:
 
     def update_plot(self, frame):
         try:
+            # Обработка задач GUI из очереди
+            now = time.time()
+            while not self.gui_queue.empty():
+                task, execute_time = self.gui_queue.queue[0]
+                if now >= execute_time:
+                    self.gui_queue.get()
+                    task()
+                else:
+                    break
+
             # Обработка задач БД в основном потоке
             while not self.db_queue.empty():
                 task = self.db_queue.get()
                 if task:
                     task()
 
-            self.ax.clear()
-            self.label_objects = []  # Сбрасываем метки каждый кадр
-
             # Остальная логика отрисовки
+            self.ax.clear()
+            self.label_objects = []
+
+            # Обновление данных интерфейса
             while not self.gui_update_queue.empty():
                 update_func = self.gui_update_queue.get()
                 update_func()
@@ -656,6 +652,10 @@ class NoSos:
             self.setup_labels()
             self.update_player_list_text()
             self.process_alerts()
+
+            # Перерисовка сохраненных алертов
+            for alert_text in self.alert_texts:
+                self.ax.add_artist(alert_text)
 
             return self.ax
         except Exception as e:
