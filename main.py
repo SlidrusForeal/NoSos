@@ -20,6 +20,9 @@ import requests
 import unicodedata
 import yaml
 from matplotlib.animation import FuncAnimation
+from telegram import Bot, Update, InlineKeyboardMarkup, InlineKeyboardButton
+from telegram.ext import Application, CommandHandler, CallbackQueryHandler
+import threading
 
 logging.basicConfig(
     level=logging.INFO,
@@ -264,10 +267,11 @@ class AlertManager:
 
         for alert in new_alerts:
             alert_id = self._generate_alert_id(alert.source, alert.message)
-            if alert_id not in self.triggered_alerts:  # Проверяем, не срабатывал ли алерт ранее
+            if alert_id not in self.triggered_alerts: # Проверяем, не срабатывал ли алерт ранее
                 self.active_alerts[alert_id] = alert
                 self.alert_history.append(alert)
                 self.triggered_alerts.add(alert_id)  # Добавляем ID в множество сработавших
+                monitor.send_notifications(alert)
 
         self._clean_expired_alerts()
 
@@ -284,6 +288,153 @@ class AlertManager:
     def get_alert_history(self, limit=50) -> List[Alert]:
         return list(self.alert_history)[-limit:]
 
+
+class TelegramNotifier:
+    def __init__(self, token: str, monitor_instance=None):
+        self.bot = Bot(token=token)
+        self.config_file = "bot_users.json"
+        self.monitor = monitor_instance  # Ссылка на монитор
+        self.registered_users = set()  # Зарегистрированные пользователи (chat_id)
+
+        self._load_users()
+        self.application = Application.builder().token(token).build()
+
+        # Регистрация обработчиков
+        self.application.add_handler(CommandHandler("start", self.handle_start))
+        self.application.add_handler(CommandHandler("alerts", self.handle_alerts))
+        self.application.add_handler(CallbackQueryHandler(self.handle_button))
+
+        # Запуск бота
+        self.application.run_polling()
+
+    def _load_users(self):
+        """Загрузка списка пользователей из файла"""
+        if os.path.exists(self.config_file):
+            with open(self.config_file, "r") as f:
+                self.registered_users = set(json.load(f))
+
+    def _save_users(self):
+        """Сохранение списка пользователей в файл"""
+        with open(self.config_file, "w") as f:
+            json.dump(list(self.registered_users), f)
+
+    async def handle_start(self, update: Update, context):
+        """Обработчик команды /start"""
+        user = update.effective_user
+        chat_id = update.effective_chat.id
+
+        if chat_id not in self.registered_users:
+            self.registered_users.add(chat_id)
+            self._save_users()
+            logging.info(f"Новый пользователь зарегистрирован: {user.username} (chat_id: {chat_id})")
+
+        await update.message.reply_text(
+            "✅ Добро пожаловать! Вы успешно зарегистрированы.\n"
+            "Вы будете получать уведомления.",
+            parse_mode="Markdown"
+        )
+
+    async def send_alert(self, alert):
+        """Отправка уведомления всем пользователям"""
+        if not self.registered_users:
+            logging.warning("Нет зарегистрированных пользователей для отправки уведомлений.")
+            return
+
+        message = self._format_alert_message(alert)
+        reply_markup = self._create_alert_keyboard(alert)
+
+        for chat_id in self.registered_users:
+            try:
+                await self.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="Markdown",
+                    reply_markup=reply_markup,
+                    disable_web_page_preview=True
+                )
+            except Exception as e:
+                logging.error(f"Ошибка отправки сообщения для chat_id {chat_id}: {e}")
+
+    def _format_alert_message(self, alert) -> str:
+        """Форматирование сообщения об алерте"""
+        message = (
+            f"🚨 *{alert.source.upper()} Alert* 🚨\n"
+            f"• Уровень: `{alert.level.name}`\n"
+            f"• Сообщение: {alert.message}\n"
+            f"• Время: {alert.timestamp.strftime('%H:%M:%S')}\n"
+        )
+
+        if alert.metadata:
+            metadata = "\n".join([f"• {k}: `{v}`" for k, v in alert.metadata.items()])
+            message += f"\n*Детали:*\n{metadata}"
+
+        return message
+
+    def _create_alert_keyboard(self, alert) -> InlineKeyboardMarkup:
+        """Создание интерактивной клавиатуры для алерта"""
+        buttons = [
+            [
+                InlineKeyboardButton("🔄 Обновить", callback_data="refresh"),
+                InlineKeyboardButton("❌ Закрыть", callback_data="close")
+            ],
+            [
+                InlineKeyboardButton(
+                    "📊 Статистика",
+                    url=f"http://your-monitor-domain.com/stats/{alert.source}"
+                )
+            ]
+        ]
+        return InlineKeyboardMarkup(buttons)
+
+    async def handle_alerts(self, update: Update, context):
+        """Обработчик команды /alerts"""
+        if not self.monitor:
+            await update.message.reply_text("⚠️ Система мониторинга не доступна.")
+            return
+
+        alerts = self.monitor.alert_manager.get_alert_history(10)
+        if not alerts:
+            await update.message.reply_text("ℹ️ Нет активных оповещений.")
+            return
+
+        response = ["*Последние 10 оповещений:*\n"]
+        for i, alert in enumerate(reversed(alerts), 1):
+            response.append(
+                f"{i}. [{alert.level.name}] {alert.message} "
+                f"({alert.timestamp.strftime('%H:%M:%S')})"
+            )
+
+        await update.message.reply_text(
+            "\n".join(response),
+            parse_mode="Markdown"
+        )
+
+    async def handle_button(self, update: Update, context):
+        """Обработчик инлайн-кнопок"""
+        query = update.callback_query
+        await query.answer()
+
+        if query.data == "refresh":
+            await self._handle_refresh(query)
+        elif query.data == "close":
+            await self._handle_close(query)
+
+    async def _handle_refresh(self, query):
+        """Обновление сообщения"""
+        try:
+            await query.edit_message_text(
+                text=f"{query.message.text}\n\n🔄 Обновлено: {datetime.now().strftime('%H:%M:%S')}",
+                parse_mode="Markdown"
+            )
+        except Exception as e:
+            logging.error(f"Ошибка обновления сообщения: {str(e)}")
+
+    async def _handle_close(self, query):
+        """Удаление сообщения"""
+        try:
+            await query.delete_message()
+        except Exception as e:
+            logging.error(f"Ошибка удаления сообщения: {str(e)}")
 
 class NoSos:
     def __init__(self):
@@ -313,8 +464,15 @@ class NoSos:
         self.start_data_thread()
         self.start_db_handler()
         self.load_translations()
+        self.init_telegram()
 
 
+    def init_telegram(self):
+        bot = TelegramNotifier("7998680701:AAGl29f22cMIcC6qXVmMszwjYREbMaBztRo")
+
+    def send_notifications(self, alert: Alert):
+        if hasattr(self, 'tg_notifier'):
+            self.tg_notifier.send_alert(alert)
     @staticmethod
     def load_config():
         with open('config.yaml', 'r', encoding='utf-8') as f:
