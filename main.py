@@ -14,7 +14,6 @@ from datetime import datetime
 from enum import Enum, auto
 from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
-
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
@@ -45,12 +44,13 @@ class Alert:
     source: str
     timestamp: datetime
     metadata: Dict[str, Any] = None
+    cooldown: float = 60  # Добавлено поле cooldown
 
 
 class BaseAlertRule(ABC):
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.cooldown = config.get("cooldown", 60)
+        self.cooldown = config.get("cooldown", 20)
         self.last_triggered: Dict[str, float] = {}
         self.alert_level = config.get("alert_level", AlertLevel.WARNING)
 
@@ -124,7 +124,6 @@ class MovementAnomalyRule(BaseAlertRule):
         return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
 
     def _create_speed_alert(self, player: Dict, speed: float) -> Alert:
-        """Генерация алерта о превышении скорости"""
         return Alert(
             message=f"Игрок {player['name']} движется со скоростью {speed:.1f} блоков/сек",
             level=self.alert_level,
@@ -134,11 +133,11 @@ class MovementAnomalyRule(BaseAlertRule):
                 "player": player['name'],
                 "speed": speed,
                 "position": player["position"]
-            }
+            },
+            cooldown=self.cooldown  # Установка cooldown из правила
         )
 
     def _create_teleport_alert(self, player: Dict, distance: float) -> Alert:
-        """Генерация алерта о возможном телепорте"""
         return Alert(
             message=f"Игрок {player['name']} переместился на {distance:.1f} блоков мгновенно",
             level=AlertLevel.CRITICAL,
@@ -149,7 +148,8 @@ class MovementAnomalyRule(BaseAlertRule):
                 "distance": distance,
                 "from": self._get_player_history(player["uuid"])[0],
                 "to": player["position"]
-            }
+            },
+            cooldown=self.cooldown
         )
 
 
@@ -205,7 +205,8 @@ class ZoneIntrusionRule(BaseAlertRule):
                 "player": player.get('name'),
                 "zone": zone_name,
                 "coordinates": (x, z)
-            }
+            },
+            cooldown=self.cooldown  # Установка cooldown из правила
         )
 
 
@@ -227,6 +228,7 @@ class AlertManager:
         self.rules: List[BaseAlertRule] = []
         self.active_alerts: Dict[str, Alert] = {}
         self.alert_history = deque(maxlen=1000)
+        self.triggered_alerts = set()  # Храним уникальные ID сработавших алертов
 
     def get_active_alerts(self) -> List[Alert]:
         """Возвращает список активных алертов"""
@@ -262,15 +264,20 @@ class AlertManager:
 
         for alert in new_alerts:
             alert_id = self._generate_alert_id(alert.source, alert.message)
-            self.active_alerts[alert_id] = alert
-            self.alert_history.append(alert)
+            if alert_id not in self.triggered_alerts:  # Проверяем, не срабатывал ли алерт ранее
+                self.active_alerts[alert_id] = alert
+                self.alert_history.append(alert)
+                self.triggered_alerts.add(alert_id)  # Добавляем ID в множество сработавших
 
         self._clean_expired_alerts()
 
     def _clean_expired_alerts(self):
-        expire_time = time.time() - 3600
-        to_remove = [aid for aid, alert in self.active_alerts.items()
-                     if alert.timestamp.timestamp() < expire_time]
+        current_time = time.time()
+        to_remove = []
+        for alert_id, alert in self.active_alerts.items():
+            expire_time = alert.timestamp.timestamp() + alert.cooldown
+            if current_time > expire_time:
+                to_remove.append(alert_id)
         for aid in to_remove:
             del self.active_alerts[aid]
 
@@ -543,9 +550,31 @@ class NoSos:
             logging.error(f"Ошибка обработки данных: {str(e)}")
 
     def process_alerts(self):
-        for alert in self.alert_manager.get_active_alerts():
-            self.show_alert(alert)
-            logging.warning(f"АКТИВНЫЙ АЛЕРТ: {alert.message}")
+        # Удаляем только несуществующие и успешно удаленные алерты
+        current_texts = set(self.ax.texts)
+        self.alert_texts = [
+            alert_text for alert_text in self.alert_texts
+            if alert_text in current_texts and not self.safe_remove(alert_text)
+        ]
+
+        # Добавляем новые алерты
+        active_alerts = self.alert_manager.get_active_alerts()
+        current_messages = {t.get_text() for t in self.alert_texts}
+
+        for alert in active_alerts:
+            alert_text = f"⚠ {alert.message} ⚠"
+            if alert_text not in current_messages:
+                self.show_alert(alert)
+    def safe_remove(self, artist) -> bool:
+        """Безопасное удаление художника с возвратом статуса успеха"""
+        try:
+            artist.remove()
+            return True
+        except ValueError:
+            return False
+        except Exception as e:
+            logging.error(f"Ошибка удаления: {str(e)}")
+            return False
 
     def show_alert(self, alert: Alert):
         try:
