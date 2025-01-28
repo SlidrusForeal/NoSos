@@ -16,6 +16,11 @@ display:
     bg_color: "#000000"
     bg_alpha: 0.5
     y_offset: 8
+notifications:
+  telegram:
+    token: "7998680701:AAGl29f22cMIcC6qXVmMszwjYREbMaBztRo"
+    admin_username: "OhNoRatzz"  # Должен совпадать с вашим @username
+
 alerts:
   zones:
     - name: "Спавн"
@@ -27,6 +32,10 @@ alerts:
       alert_level: "INFO"
       cooldown: 30
       excluded: True
+      sound: True
+      sound_params:
+        frequency: 2000
+        duration: 1000
 
     - name: "Сосмарк"
       bounds:
@@ -35,7 +44,6 @@ alerts:
         zmin: -3465
         zmax: -2225
       allowed_players:
-        - "K1zik"
         - "Kwakich"
         - "_DeN41k_"
         - "Bruno_Hempf"
@@ -47,7 +55,7 @@ alerts:
         - "BotEnot"
         - "_mixailchert_"
         - "VuLo4ka"
-        - "Aphgust"
+        - "Aphgust_"
         - "Sir_Bred"
         - "Timondarck"
         - "italianopelmen"
@@ -144,15 +152,10 @@ alerts:
     max_players: 50
     alert_level: "CRITICAL"
 
-  movement_anomaly:  # Новое правило для аномалий перемещения
-    alert_level: "CRITICAL"
-    cooldown: 300  # 5 минут
-    max_speed: 75  # блоков/сек
-    teleport_threshold: 500  # блоков
-
 heatmap:
+  history_file: "heatmap_history.pkl"
+  max_history: 100000
   bins: 100
   cmap: "hot"
   alpha: 0.7
-  max_history: 100000
-  history_file: "heatmap_history.pkl"
+  mode: "history"
