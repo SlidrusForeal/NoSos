@@ -16,11 +16,17 @@ display:
     bg_color: "#000000"
     bg_alpha: 0.5
     y_offset: 8
-notifications:
-  telegram:
-    token: "7998680701:AAGl29f22cMIcC6qXVmMszwjYREbMaBztRo"
-    admin_username: "OhNoRatzz"  # Должен совпадать с вашим @username
-
+security:
+  admins:
+    - "833655522"
+  log_file: "security.log"
+  alert_on_unauthorized: true
+database:
+  filename: "activity.db"
+telegram:
+  token: "7998680701:AAFLhnk1YmoKR3HDwct8VBQiPvhz9FOGk7U"
+  chat_id: "833655522"
+  admin_commands: ["/approve", "/users"]  # Добавить эту строку
 alerts:
   zones:
     - name: "Спавн"
@@ -44,6 +50,7 @@ alerts:
         zmin: -3465
         zmax: -2225
       allowed_players:
+        - "K1zik"
         - "Kwakich"
         - "_DeN41k_"
         - "Bruno_Hempf"
@@ -55,7 +62,7 @@ alerts:
         - "BotEnot"
         - "_mixailchert_"
         - "VuLo4ka"
-        - "Aphgust_"
+        - "Aphgust"
         - "Sir_Bred"
         - "Timondarck"
         - "italianopelmen"
@@ -151,6 +158,15 @@ alerts:
   limits:
     max_players: 50
     alert_level: "CRITICAL"
+  movement_anomaly:
+    max_speed: 50
+    teleport_threshold: 100
+    alert_level: "CRITICAL"
+  database:
+    filename: "activity.db"
+  language: "ru"
+  themes:
+    default: "dark"
 
 heatmap:
   history_file: "heatmap_history.pkl"
