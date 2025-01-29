@@ -41,7 +41,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('monitor.log'),
+        logging.FileHandler('monitor.log', encoding='utf-8'),  # Добавлена кодировка
         logging.StreamHandler()
     ]
 )
@@ -596,12 +596,13 @@ class TelegramBot:
         await update.message.reply_text(help_text, parse_mode='Markdown')
 
     async def stats_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not hasattr(self.monitor, 'activity_by_hour'):
-            await update.message.reply_text("📊 Данные статистики не загружены")
+        if not self.monitor.activity_by_hour:
+            await update.message.reply_text("📊 Данные статистики отсутствуют")
             return
 
-        # Передаем кортеж с функцией, аргументами и временем выполнения
-        self.monitor.gui_queue.put((self.monitor.generate_stats_plot, (update,), time.time()))
+        self.monitor.gui_queue.put(
+            (self.monitor.generate_stats_plot, (update,), time.time())
+        )
 
     async def track_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Трекинг конкретного игрока с интерактивным меню"""
@@ -638,6 +639,12 @@ class TelegramBot:
             reply_markup=InlineKeyboardMarkup(keyboard)
         )
 
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        """Нормализация имени игрока для callback_data"""
+        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
+        return re.sub(r'[^a-zA-Z0-9_]', '', name).lower()
+
     async def handle_tracking_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         try:
@@ -654,12 +661,17 @@ class TelegramBot:
             action = parts[1]
             player_name = '_'.join(parts[2:])
 
-            # Нормализация имени игрока
-            normalized_name = self._normalize_name(player_name)
+            # Используем метод нормализации из TelegramBot
+            normalized_name = self._normalize_name(player_name)  # Теперь метод доступен
             tracking_data = self.monitor.get_player_tracking_data(normalized_name)
 
             if not tracking_data['current_pos']:
-                await query.edit_message_text("❌ Игрок не найден")
+                await query.edit_message_text("❌ Позиция игрока недоступна")
+                return
+
+            x, z = tracking_data['current_pos']
+            if x is None or z is None:
+                await query.edit_message_text("❌ Координаты не найдены")
                 return
 
             # Обработка действий
@@ -991,6 +1003,8 @@ class NoSos:
 
     def generate_stats_plot(self, update: Update):
         try:
+            if not self.activity_by_hour:
+                raise ValueError("Нет данных для статистики")
             plt.figure(figsize=(10, 5))
             plt.bar(self.activity_by_hour.keys(), self.activity_by_hour.values())
             plt.title("Активность игроков по часам")
@@ -1009,10 +1023,17 @@ class NoSos:
                     caption="📊 Статистика активности"
                 )
 
-            asyncio.run_coroutine_threadsafe(send_plot(), self.telegram_bot.loop)
+            # Используем текущий цикл событий
+                loop = asyncio.get_event_loop()
+                asyncio.run_coroutine_threadsafe(send_plot(), loop)
 
         except Exception as e:
             logging.error(f"Ошибка генерации графика: {str(e)}")
+            loop = asyncio.get_event_loop()
+            asyncio.run_coroutine_threadsafe(
+                update.message.reply_text(f"❌ Ошибка: {str(e)}"),
+                loop
+            )
     def create_tables(self):
         try:
             cursor = self.conn.cursor()
