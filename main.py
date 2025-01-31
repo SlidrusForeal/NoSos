@@ -19,6 +19,7 @@ from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
 
 import matplotlib
+
 matplotlib.use('Agg')
 
 import matplotlib.pyplot as plt
@@ -411,7 +412,8 @@ class TelegramBot:
     async def _check_admin(self, update: Update) -> bool:
         user_id = str(update.effective_user.id)
         if not self.monitor.security.is_admin(user_id):
-            await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
+            await update.message.reply_text(
+                "⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
             return False
         return True
 
@@ -731,8 +733,6 @@ class TelegramBot:
 
 class NoSos:
     def __init__(self):
-        self.window_title = "NoSos"
-        self.icon_path = "icon.ico"
         self.config = self.load_config()
         self.security = SecurityManager(self.config)
         self.telegram_bot = TelegramBot(self.config, self)
@@ -828,22 +828,11 @@ class NoSos:
     def setup_plot(self):
         plt.style.use('dark_background')
         self.fig = plt.figure(
-            figsize=(16, 10),
-            num=self.window_title
+            figsize=(16, 10)
         )
         self.ax = self.fig.add_subplot(111)
         self.fig.subplots_adjust(right=0.7, left=0.05)
         self.setup_controls()
-
-        try:
-            if plt.get_backend().lower() == 'tkagg':
-                manager = plt.get_current_fig_manager()
-                manager.window.wm_iconbitmap(self.icon_path)
-            elif plt.get_backend().lower() == 'qt5agg':
-                manager = plt.get_current_fig_manager()
-                manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
-        except Exception as e:
-            logging.error(f"Ошибка установки иконки: {str(e)}")
 
         self.ax = self.fig.add_subplot(111)
 
@@ -1317,16 +1306,16 @@ class NoSos:
 
             self.player_list_text.set_text("\n".join(text_lines))
 
-        def run(self):
-            try:
-                ani = FuncAnimation(
-                    self.fig, self.update_plot,
-                    interval=2000,
-                    cache_frame_data=False
-                )
-                ani.save('animation.mp4')  # Сохранить анимацию в файл
-            finally:
-                self.shutdown()
+    def run(self):
+        try:
+            ani = FuncAnimation(
+                self.fig, self.update_plot,
+                interval=2000,
+                cache_frame_data=False
+            )
+            ani.save('animation.mp4')  # Сохранить анимацию в файл
+        finally:
+            self.shutdown()
 
     def translate(self, key):
         return self.translations[self.language].get(key, key)
