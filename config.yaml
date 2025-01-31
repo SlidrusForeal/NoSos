@@ -26,7 +26,7 @@ database:
 telegram:
   token: "7998680701:AAFLhnk1YmoKR3HDwct8VBQiPvhz9FOGk7U"
   chat_id: "833655522"
-  admin_commands: ["/approve", "/users"]  # Добавить эту строку
+  admin_commands: ["/approve", "/users"]
 alerts:
   zones:
     - name: "Спавн"
@@ -35,6 +35,7 @@ alerts:
         xmax: 500
         zmin: -500
         zmax: 500
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 30
       excluded: True
@@ -50,7 +51,8 @@ alerts:
         zmin: -3465
         zmax: -2225
       allowed_players:
-        - "K1zik"
+        - "KomJys"
+        - "MrSemper"
         - "Kwakich"
         - "_DeN41k_"
         - "Bruno_Hempf"
@@ -66,7 +68,6 @@ alerts:
         - "Sir_Bred"
         - "Timondarck"
         - "italianopelmen"
-        - "KomJys"
         - "BaBiEdA"
         - "poshelyanaher"
         - "Peridotik"
@@ -79,78 +80,91 @@ alerts:
     # Новые зоны с excluded: True
     - name: "Евгенбург"
       bounds: {xmin: -878, xmax: -282, zmin: 471, zmax: 900}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Redplate"
       bounds: {xmin: 1039, xmax: 1857, zmin: 803, zmax: 1431}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Бодлэнд"
       bounds: {xmin: 1820, xmax: 2250, zmin: 1148, zmax: 1708}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Нексус-9"
       bounds: {xmin: -3230, xmax: -2526, zmin: 4951, zmax: 5594}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Эсторская Республика"
       bounds: {xmin: 5777, xmax: 7079, zmin: -4944, zmax: -4124}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Сайкен"
       bounds: {xmin: -9780, xmax: -9178, zmin: 12, zmax: 990}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Гримбург"
       bounds: {xmin: -4078, xmax: -3193, zmin: -1333, zmax: -539}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Черномория"
       bounds: {xmin: 1996, xmax: 3845, zmin: 3541, zmax: 5907}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "СудовАпатов"
       bounds: {xmin: -561, xmax: 345, zmin: -3770, zmax: -2683}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "ЧиллХата"
       bounds: {xmin: 4861, xmax: 6082, zmin: -609, zmax: 323}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Город чепуша"
       bounds: {xmin: -3953, xmax: -3373, zmin: -3329, zmax: -2856}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Телория"
       bounds: {xmin: -1642, xmax: -1012, zmin: -1521, zmax: -744}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
 
     - name: "Мединск"
       bounds: {xmin: -806, xmax: -589, zmin: -322, zmax: 476}
+      allowed_players: []
       alert_level: "INFO"
       cooldown: 60
       excluded: True
@@ -170,7 +184,7 @@ alerts:
 
 heatmap:
   history_file: "heatmap_history.pkl"
-  max_history: 100000
+  max_history: 10000000
   bins: 100
   cmap: "hot"
   alpha: 0.7
