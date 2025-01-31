@@ -8,6 +8,7 @@ import sqlite3
 import time
 import unicodedata
 import re
+import numpy as np
 import random
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
@@ -32,7 +33,6 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
-from telegram.error import TimedOut
 from telegram.request import HTTPXRequest
 import asyncio
 
@@ -136,9 +136,8 @@ class MovementAnomalyRule(BaseAlertRule):
         self.player_positions[player_id] = (pos, timestamp)
 
     @staticmethod
-    def _calculate_distance(pos1: Tuple[float, float], pos2: Tuple[float, float]) -> float:
-        """Расчет расстояния между двумя точками"""
-        return ((pos1[0] - pos2[0]) ** 2 + (pos1[1] - pos2[1]) ** 2) ** 0.5
+    def _calculate_distance(pos1, pos2):
+        return np.linalg.norm(np.array(pos1) - np.array(pos2))
 
     def _create_speed_alert(self, player: Dict, speed: float) -> Alert:
         return Alert(
@@ -178,7 +177,9 @@ class ZoneIntrusionRule(BaseAlertRule):
     @staticmethod
     @lru_cache(maxsize=1000)
     def _normalize_name(name: str) -> str:
-        return unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode().lower()
+        """Нормализует имя для callback_data"""
+        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
+        return re.sub(r'[^a-zA-Z0-9_]', '', name).lower()
 
     @lru_cache(maxsize=500)
     def _in_zone(self, x: float, z: float) -> bool:
@@ -274,7 +275,12 @@ class AlertManager:
         new_alerts = []
         for rule in self.rules:
             try:
-                new_alerts.extend(rule.check_conditions(data))
+                alerts = rule.check_conditions(data)
+                for alert in alerts:
+                    alert_id = self._generate_alert_id(alert.source, alert.message)
+                    if alert_id not in self.active_alerts:
+                        new_alerts.append(alert)
+                        self.active_alerts[alert_id] = alert
             except Exception as e:
                 logging.error(f"Ошибка в правиле {rule.__class__.__name__}: {str(e)}")
 
@@ -341,6 +347,7 @@ class AnalyticsEngine:
 
 class TelegramBot:
     def __init__(self, config, monitor, users_file='users.csv'):
+        self.users_lock = threading.Lock()
         self.monitor = monitor
         self.config = config
         self.users_file = users_file
@@ -380,50 +387,123 @@ class TelegramBot:
         return True
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        users = pd.read_csv(self.users_file)
+        try:
+            user = update.effective_user
+            user_id = user.id
+            username = user.username or ""
+            avatar = None
+            # Получаем аватарку (если есть)
+            user_profile_photos = await context.bot.get_user_profile_photos(user_id, limit=1)
+            if user_profile_photos.total_count > 0:
+                avatar = user_profile_photos.photos[0][-1]
 
-        if str(user_id) in users['user_id'].values:
-            await update.message.reply_text("🛠 Вы уже зарегистрированы")
-        else:
-            new_user = pd.DataFrame([[user_id, "", False, True]], columns=users.columns)
-            users = pd.concat([users, new_user], ignore_index=True)
-            users.to_csv(self.users_file, index=False)
-            await update.message.reply_text("✅ Запрос отправлен администратору")
+            # Блокировка для потокобезопасной работы с файлом
+            with self.users_lock:
+                # Чтение и запись с использованием менеджера контекста
+                with open(self.users_file, 'r+', encoding='utf-8') as f:
+                    users = pd.read_csv(f)
+                    if str(user_id) in users['user_id'].astype(str).values:
+                        await update.message.reply_text(
+                            "🛠 *Вы уже зарегистрированы в системе*",
+                            parse_mode='Markdown'
+                        )
+                        return
+                    # Нормализация имени
+                    normalized_name = self._normalize_name(username) if username else ""
+                    new_user = pd.DataFrame([[
+                        user_id,
+                        normalized_name,
+                        False,  # approved
+                        True  # subscribed
+                    ]], columns=users.columns)
+                    users = pd.concat([users, new_user], ignore_index=True)
+                    f.seek(0)
+                    users.to_csv(f, index=False)
 
-            keyboard = [[InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{user_id}")]]
-            await self.bot.send_message(
-                chat_id=self.admin_id,
-                text=f"⚠ Новый запрос от ID: {user_id}",
-                reply_markup=InlineKeyboardMarkup(keyboard)
+            # Ответ пользователю
+            await update.message.reply_text(
+                "✅ *Ваш запрос отправлен администратору*",
+                parse_mode='Markdown'
+            )
+            # Формирование сообщения для админа
+            admin_text = (
+                f"👤 *Новый запрос на доступ*\n"
+                f"🆔 ID: `{user_id}`\n"
+                f"📛 Имя: {user.full_name}\n"
+                f"🌐 Username: @{username if username else 'N/A'}"
+            )
+            # Клавиатура с кнопками
+            keyboard = [
+                [
+                    InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{user_id}"),
+                    InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user_id}")
+                ]
+            ]
+            # Отправка сообщения админу
+            if avatar:
+                await context.bot.send_photo(
+                    chat_id=self.admin_id,
+                    photo=avatar.file_id,
+                    caption=admin_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+            else:
+                await context.bot.send_message(
+                    chat_id=self.admin_id,
+                    text=admin_text,
+                    reply_markup=InlineKeyboardMarkup(keyboard),
+                    parse_mode='Markdown'
+                )
+        except Exception as e:
+            logging.error(f"Ошибка в команде /start: {str(e)}", exc_info=True)
+            await update.message.reply_text(
+                "⚠️ *Произошла ошибка при обработке запроса*",
+                parse_mode='Markdown'
             )
 
     async def approve_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Ensure only admins can use this command
         if not await self._check_admin(update):
+            await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
             return
 
+        # Validate the user ID argument
         if not context.args or not context.args[0].isdigit():
             await update.message.reply_text("❌ Используйте: /approve <ID пользователя>")
             return
 
         user_id = context.args[0]
-        users = pd.read_csv(self.users_file)
-        users.loc[users['user_id'] == int(user_id), 'approved'] = True
-        users.to_csv(self.users_file, index=False)
 
-        await update.message.reply_text(f"✅ Пользователь {user_id} одобрен")
-        await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен администратором!")
+        try:
+            with self.users_lock:
+                users = pd.read_csv(self.users_file)
+                matching_users = users.loc[users['user_id'] == int(user_id)]
+
+                if matching_users.empty:
+                    await update.message.reply_text(f"❌ Пользователь с ID {user_id} не найден.")
+                    return
+
+                users.loc[users['user_id'] == int(user_id), 'approved'] = True
+                users.to_csv(self.users_file, index=False)
+
+            await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен администратором!")
+            await update.message.reply_text(f"✅ Пользователь {user_id} одобрен")
+
+        except Exception as e:
+            print(f"Error in approve_user: {e}")
+            await update.message.reply_text("Произошла ошибка при одобрении пользователя.")
 
     async def list_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_admin(update):
             return
 
         users = pd.read_csv(self.users_file)
-        text = "📋 Пользователи:\n" + "\n".join(
-            f"ID: {row['user_id']} | Статус: {'Одобрен' if row['approved'] else 'Ожидает'}"
-            for _, row in users.iterrows()
-        )
-        await update.message.reply_text(text)
+        text = "📋 *Список пользователей:*\n"
+        for _, row in users.iterrows():
+            status = "✅ Одобрен" if row['approved'] else "⏳ Ожидает"
+            text += f"🆔 `{row['user_id']}` | 👤 {row['username'] or 'N/A'} | {status}\n"
+        await update.message.reply_text(text, parse_mode='Markdown')
 
     async def send_message_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_admin(update):
@@ -446,17 +526,36 @@ class TelegramBot:
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()
-        data = query.data.split('_')
+        await query.answer()  # Acknowledge the callback query
 
-        if data[0] == "approve":
+        try:
+            # Extract user ID from callback data
+            data = query.data.split('_')
+            if data[0] != "approve":
+                return  # Ignore irrelevant callbacks
+
             user_id = data[1]
-            users = pd.read_csv(self.users_file)
-            users.loc[users['user_id'] == int(user_id), 'approved'] = True
-            users.to_csv(self.users_file, index=False)
 
+            # Update the user's status in the CSV file
+            with self.users_lock:
+                users = pd.read_csv(self.users_file)
+                users.loc[users['user_id'] == int(user_id), 'approved'] = True
+                users.to_csv(self.users_file, index=False)
+
+            # Notify the user of approval
             await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен!")
-            await query.edit_message_text(text=f"Пользователь {user_id} одобрен")
+
+            # Edit the original message if it contains text
+            if query.message and query.message.text:
+                await query.edit_message_text(text=f"Пользователь {user_id} одобрен")
+            else:
+                # Handle non-text messages by sending a new message
+                await query.message.reply_text(f"Пользователь {user_id} одобрен")
+
+        except Exception as e:
+            # Log the error and notify the admin
+            print(f"Error in handle_callback: {e}")
+            await query.message.reply_text("Произошла ошибка при обработке запроса.")
 
     async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -467,9 +566,17 @@ class TelegramBot:
 
     async def subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
-        users = pd.read_csv(self.users_file)
-        users.loc[users['user_id'] == int(user_id), 'subscribed'] = True
-        users.to_csv(self.users_file, index=False)
+        with self.users_lock:
+            users = pd.read_csv(self.users_file)
+            user = users[users['user_id'] == int(user_id)]
+            if user.empty:
+                await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
+                return
+            if user['subscribed'].values[0]:
+                await update.message.reply_text("ℹ Вы уже подписаны на уведомления.")
+                return
+            users.loc[users['user_id'] == int(user_id), 'subscribed'] = True
+            users.to_csv(self.users_file, index=False)
         await update.message.reply_text("🔔 Вы подписались на уведомления!")
 
     async def history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -489,13 +596,21 @@ class TelegramBot:
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = """
-        📚 Доступные команды:
-        /start - Регистрация
-        /help - Помощь
-        /unsubscribe - Отписаться
-        /history - История перемещений
+        🎮 *Доступные команды* 🎮
+
+        🔹 *Основные*
+        /start - Регистрация в системе
+        /help - Справка по командам
+        /subscribe - Подписаться на уведомления
+        /unsubscribe - Отписаться от уведомлений
+        /history - Топ активных игроков
+
+        🔒 *Административные*
+        /users - Список пользователей (админы)
+        /approve [id] - Одобрить пользователя (админы)
+        /send [id] [сообщение] - Отправить сообщение (админы)
         """
-        await update.message.reply_text(help_text)
+        await update.message.reply_text(help_text, parse_mode='Markdown')
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ Используйте /help для списка команд")
@@ -504,6 +619,13 @@ class TelegramBot:
         """Запуск бота с явным созданием цикла событий"""
         asyncio.set_event_loop(asyncio.new_event_loop())
         self.app.run_polling()
+
+    @staticmethod
+    @lru_cache(maxsize=1000)
+    def _normalize_name(name: str) -> str:
+        """Нормализует имя для callback_data"""
+        name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
+        return re.sub(r'[^a-zA-Z0-9_]', '', name).lower()
 class NoSos:
     def __init__(self):
         self.config = self.load_config()
@@ -559,9 +681,13 @@ class NoSos:
             users = pd.read_csv(self.telegram_bot.users_file)
             approved_users = users[users['approved'] & users['subscribed']]
 
-            message = f"⚠ {alert.message} ⚠"
+            message = f"""
+            🚨 *{alert.source.upper()}* 🚨
+            _Игрок {alert.metadata['player']} в зоне {alert.metadata['zone']}_
+            🕒 {alert.timestamp.strftime('%Y-%m-%d %H:%M')}
+            """
             for user_id in approved_users['user_id']:
-                await self.telegram_bot.bot.send_message(chat_id=user_id, text=message)
+                await self.telegram_bot.bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
                 await asyncio.sleep(0.5)  # ⏳ Задержка между отправками (500 мс)
         except Exception as e:
             logging.error(f"Ошибка в асинхронной отправке: {str(e)}")
