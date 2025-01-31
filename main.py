@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import pickle
+import asyncpg
 import queue
 import sqlite3
 import time
@@ -54,6 +55,9 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+logger = logging.getLogger(__name__)
+
+DATABASE_URL = "postgresql://postgres:IgCDeaSMmvIUsvwUrcUAwygSBvPmSylG@postgres.railway.internal:5432/railway"
 
 
 class AlertLevel(Enum):
@@ -62,14 +66,52 @@ class AlertLevel(Enum):
     CRITICAL = auto()
 
 
-@dataclass(frozen=True)
+async def init_db():
+    return await asyncpg.connect(DATABASE_URL)
+
+
+async def create_tables():
+    conn = await init_db()
+    try:
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                user_id BIGINT PRIMARY KEY,
+                username TEXT,
+                approved BOOLEAN DEFAULT FALSE,
+                subscribed BOOLEAN DEFAULT FALSE
+            )
+        ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS activity (
+                id SERIAL PRIMARY KEY,
+                player TEXT,
+                time FLOAT,
+                hour INTEGER,
+                date DATE
+            )
+        ''')
+
+        await conn.execute('''
+            CREATE TABLE IF NOT EXISTS zones (
+                id SERIAL PRIMARY KEY,
+                player TEXT,
+                zone TEXT,
+                time FLOAT,
+                date DATE
+            )
+        ''')
+    finally:
+        await conn.close()
+
+@dataclass
 class Alert:
     message: str
-    level: AlertLevel
+    level: str
     source: str
     timestamp: datetime
     metadata: Dict[str, Any] = None
-    cooldown: float = 60  # Добавлено поле cooldown
+    cooldown: float = 60
 
 
 class BaseAlertRule(ABC):
@@ -369,15 +411,12 @@ class AnalyticsEngine:
 
 
 class TelegramBot:
-    def __init__(self, config, monitor, users_file='users.csv'):
-        self.users_lock = threading.Lock()
+    def __init__(self, config, monitor):
         self.monitor = monitor
         self.config = config
-        self.users_file = users_file
         self.admin_id = str(config['telegram']['chat_id'])
         self.bot = Bot(token=config['telegram']['token'])
         self.app = ApplicationBuilder().token(config['telegram']['token']).build()
-        self._init_users_file()
         self._register_handlers()
 
         # Инициализируем модуль аналитики
@@ -432,36 +471,26 @@ class TelegramBot:
         return True
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        user = update.effective_user
+        user_id = user.id
         try:
-            user = update.effective_user
-            user_id = user.id
             username = user.username or ""
             avatar = None
-            # Получаем аватарку (если есть)
             user_profile_photos = await context.bot.get_user_profile_photos(user_id, limit=1)
             if user_profile_photos.total_count > 0:
                 avatar = user_profile_photos.photos[0][-1]
-
-            # Потокобезопасное обновление файла пользователей
-            with self.users_lock:
-                with open(self.users_file, 'r+', encoding='utf-8') as f:
-                    users = pd.read_csv(f)
-                    if str(user_id) in users['user_id'].astype(str).values:
-                        await update.message.reply_text(
-                            "🛠 *Вы уже зарегистрированы в системе*",
-                            parse_mode='Markdown'
-                        )
-                        return
-                    normalized_name = self._normalize_name(username) if username else ""
-                    new_user = pd.DataFrame([[
-                        user_id,
-                        normalized_name,
-                        False,  # approved
-                        True  # subscribed
-                    ]], columns=users.columns)
-                    users = pd.concat([users, new_user], ignore_index=True)
-                    f.seek(0)
-                    users.to_csv(f, index=False)
+                conn = await init_db()
+                try:
+                    exists = await conn.fetchval(
+                        'SELECT 1 FROM users WHERE user_id = $1', user.id
+                    )
+                    if not exists:
+                        await conn.execute('''
+                            INSERT INTO users (user_id, username, approved, subscribed)
+                            VALUES ($1, $2, $3, $4)
+                        ''', user.id, user.username, False, False)
+                finally:
+                    await conn.close()
 
             await update.message.reply_text(
                 "✅ *Ваш запрос отправлен администратору*",
@@ -621,44 +650,26 @@ class TelegramBot:
             await query.message.reply_text("Произошла ошибка при обработке запроса.")
 
     async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = str(update.effective_user.id)
-        with self.users_lock:
-            users = pd.read_csv(self.users_file)
-            
-            # Добавляем колонку 'subscribed', если её нет
-            if 'subscribed' not in users.columns:
-                users['subscribed'] = False
-            
-            user = users[users['user_id'] == int(user_id)]
-            if user.empty:
-                await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
-                return
-            if not user['subscribed'].values[0]:
-                await update.message.reply_text("ℹ Вы уже отписаны от уведомлений.")
-                return
-            users.loc[users['user_id'] == int(user_id), 'subscribed'] = False
-            users.to_csv(self.users_file, index=False)
-        await update.message.reply_text("🔕 Вы отписались от уведомлений!")
+        user_id = update.effective_user.id
+        conn = await init_db()
+        try:
+            await conn.execute('''
+                UPDATE users SET subscribed = FALSE WHERE user_id = $1
+            ''', user_id)
+            await update.message.reply_text("🔕 Вы отписались от уведомлений!")
+        finally:
+            await conn.close()
 
     async def subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = str(update.effective_user.id)
-        with self.users_lock:
-            users = pd.read_csv(self.users_file)
-            
-            # Добавляем колонку 'subscribed', если её нет
-            if 'subscribed' not in users.columns:
-                users['subscribed'] = False
-            
-            user = users[users['user_id'] == int(user_id)]
-            if user.empty:
-                await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
-                return
-            if user['subscribed'].values[0]:
-                await update.message.reply_text("ℹ Вы уже подписаны на уведомления.")
-                return
-            users.loc[users['user_id'] == int(user_id), 'subscribed'] = True
-            users.to_csv(self.users_file, index=False)
-        await update.message.reply_text("🔔 Вы подписались на уведомления!")
+        user_id = update.effective_user.id
+        conn = await init_db()
+        try:
+            await conn.execute('''
+                UPDATE users SET subscribed = TRUE WHERE user_id = $1
+            ''', user_id)
+            await update.message.reply_text("🔔 Вы подписались на уведомления!")
+        finally:
+            await conn.close()
 
     async def history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
@@ -742,9 +753,8 @@ class TelegramBot:
         result = self.analytics.generate_player_report(player_name)
         await update.message.reply_text(result, parse_mode='Markdown')
 
-    def run(self):
-        """Запуск бота с явным созданием цикла событий"""
-        self.app.run_polling()
+    async def run(self):
+        await self.bot.app.run_polling()
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -785,6 +795,7 @@ class NoSos:
         self.start_db_handler()
         self.load_translations()
         self.telegram_bot.run()
+        asyncio.run(create_tables())
 
     def send_notifications(self, alert: Alert):
         asyncio.run(self._async_send_alert(alert))
@@ -825,18 +836,25 @@ class NoSos:
         except Exception as e:
             logging.error(f"Ошибка отправки алерта: {str(e)}")
 
+
     @staticmethod
     def load_config():
         with open('config.yaml', 'r', encoding='utf-8') as f:
-            config = yaml.safe_load(f)
+            return yaml.safe_load(f)
 
-        for zone in config['alerts']['zones']:
-            zone['alert_level'] = AlertLevel[zone.get('alert_level', 'INFO')]
-
-        if 'limits' in config['alerts']:
-            config['alerts']['limits']['alert_level'] = AlertLevel[config['alerts']['limits']['alert_level']]
-
-        return config
+    async def save_activity(self, player_data: dict):
+        conn = await init_db()
+        try:
+            await conn.execute('''
+                INSERT INTO activity (player, time, hour, date)
+                VALUES ($1, $2, $3, $4)
+            ''',
+            player_data['name'],
+            player_data['time'],
+            datetime.now().hour,
+            datetime.now().date())
+        finally:
+            await conn.close()
 
     def setup_plot(self):
         plt.style.use('dark_background')
@@ -1476,4 +1494,4 @@ class NoSos:
 
 if __name__ == "__main__":
     monitor = NoSos()
-    monitor.run()
+    asyncio.run(monitor.run())
