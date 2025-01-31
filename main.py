@@ -720,7 +720,6 @@ class TelegramBot:
 
     def run(self):
         """Запуск бота с явным созданием цикла событий"""
-        asyncio.set_event_loop(asyncio.new_event_loop())
         self.app.run_polling()
 
     @staticmethod
@@ -761,20 +760,10 @@ class NoSos:
         self.start_data_thread()
         self.start_db_handler()
         self.load_translations()
-        threading.Thread(target=self.telegram_bot.run, daemon=True).start()
+        self.telegram_bot.run()
 
     def send_notifications(self, alert: Alert):
-        try:
-            loop = None
-            try:
-                loop = asyncio.get_running_loop()  # Получаем текущий event loop
-            except RuntimeError:
-                loop = asyncio.new_event_loop()  # Создаем новый event loop, если его нет
-                threading.Thread(target=self._run_loop, args=(loop,), daemon=True).start()
-
-            asyncio.run_coroutine_threadsafe(self._async_send_alert(alert), loop)
-        except Exception as e:
-            logging.error(f"Ошибка отправки уведомления: {str(e)}")
+        asyncio.run(self._async_send_alert(alert))
 
     def _run_loop(self, loop):
         """Функция для запуска event loop в отдельном потоке"""
