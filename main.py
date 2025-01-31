@@ -25,6 +25,7 @@ import yaml
 from matplotlib.animation import FuncAnimation
 import threading
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
     CommandHandler,
@@ -334,16 +335,28 @@ class AnalyticsEngine:
         return " | ".join(anomalies) if anomalies else "Норма"
 
     def generate_heatmap_report(self) -> str:
-        zone_activity = {zone: sum(players.values()) for zone, players in self.monitor.zone_time.items()}
+        # zone_time может быть как словарь вида {zone: {player: time}} или другой – здесь пример реализации
+        zone_activity = {}
+        for zone, players in self.monitor.zone_time.items():
+            if isinstance(players, dict):
+                zone_activity[zone] = sum(players.values())
+            else:
+                zone_activity[zone] = players
         sorted_zones = sorted(zone_activity.items(), key=lambda x: x[1], reverse=True)[:5]
-        return "🔥 Топ-5 активных зон:\n" + "\n".join(f"• {zone}: {time // 60} минут" for zone, time in sorted_zones)
+        report_lines = [f"• {zone}: {time // 60} минут" for zone, time in sorted_zones]
+        return "🔥 Топ-5 активных зон:\n" + "\n".join(report_lines)
 
     def generate_player_report(self, player_name: str) -> str:
         total_time = self.monitor.player_time.get(player_name, 0)
         zone_time = self.monitor.zone_time.get(player_name, {})
-        return (f"📊 Отчёт по игроку *{player_name}*\n"
-                f"Общее время онлайн: {total_time // 3600} ч. {total_time % 3600 // 60} мин.\n"
-                "Время в зонах:\n" + "\n".join(f"• {zone}: {time // 60} мин." for zone, time in zone_time.items()))
+        report = (
+            f"📊 Отчёт по игроку *{player_name}*\n"
+            f"Общее время онлайн: {total_time // 3600} ч. {total_time % 3600 // 60} мин.\n"
+            "Время в зонах:\n"
+        )
+        for zone, time in zone_time.items():
+            report += f"• {zone}: {time // 60} мин.\n"
+        return report
 
 class TelegramBot:
     def __init__(self, config, monitor, users_file='users.csv'):
@@ -352,14 +365,17 @@ class TelegramBot:
         self.config = config
         self.users_file = users_file
         self.admin_id = str(config['telegram']['chat_id'])
-        self.bot = Bot(token=config['telegram']['token'], request=request)
+        self.bot = Bot(token=config['telegram']['token'])
         self.app = ApplicationBuilder().token(config['telegram']['token']).build()
         self._init_users_file()
         self._register_handlers()
 
+        # Инициализируем модуль аналитики
+        self.analytics = AnalyticsEngine(monitor)
+
     def _init_users_file(self):
         if not os.path.exists(self.users_file):
-            with open(self.users_file, 'w') as f:
+            with open(self.users_file, 'w', encoding='utf-8') as f:
                 f.write("user_id,username,approved,subscribed\n")
 
     def _register_handlers(self):
@@ -373,6 +389,10 @@ class TelegramBot:
             CommandHandler("caramel_pain", self.caramel_pain_command),
             CommandHandler("history", self.history),
             CommandHandler("subscribe", self.subscribe),
+            # Новые команды для аналитики (только для админа)
+            CommandHandler("anomalies", self.anomalies),
+            CommandHandler("heatmap", self.heatmap),
+            CommandHandler("player_report", self.player_report),
             CallbackQueryHandler(self.handle_callback),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message),
         ]
@@ -397,9 +417,8 @@ class TelegramBot:
             if user_profile_photos.total_count > 0:
                 avatar = user_profile_photos.photos[0][-1]
 
-            # Блокировка для потокобезопасной работы с файлом
+            # Потокобезопасное обновление файла пользователей
             with self.users_lock:
-                # Чтение и запись с использованием менеджера контекста
                 with open(self.users_file, 'r+', encoding='utf-8') as f:
                     users = pd.read_csv(f)
                     if str(user_id) in users['user_id'].astype(str).values:
@@ -408,38 +427,33 @@ class TelegramBot:
                             parse_mode='Markdown'
                         )
                         return
-                    # Нормализация имени
                     normalized_name = self._normalize_name(username) if username else ""
                     new_user = pd.DataFrame([[
                         user_id,
                         normalized_name,
                         False,  # approved
-                        True  # subscribed
+                        True    # subscribed
                     ]], columns=users.columns)
                     users = pd.concat([users, new_user], ignore_index=True)
                     f.seek(0)
                     users.to_csv(f, index=False)
 
-            # Ответ пользователю
             await update.message.reply_text(
                 "✅ *Ваш запрос отправлен администратору*",
                 parse_mode='Markdown'
             )
-            # Формирование сообщения для админа
             admin_text = (
                 f"👤 *Новый запрос на доступ*\n"
                 f"🆔 ID: `{user_id}`\n"
                 f"📛 Имя: {user.full_name}\n"
                 f"🌐 Username: @{username if username else 'N/A'}"
             )
-            # Клавиатура с кнопками
             keyboard = [
                 [
                     InlineKeyboardButton("✅ Одобрить", callback_data=f"approve_{user_id}"),
                     InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user_id}")
                 ]
             ]
-            # Отправка сообщения админу
             if avatar:
                 await context.bot.send_photo(
                     chat_id=self.admin_id,
@@ -463,12 +477,10 @@ class TelegramBot:
             )
 
     async def approve_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        # Ensure only admins can use this command
         if not await self._check_admin(update):
             await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
             return
 
-        # Validate the user ID argument
         if not context.args or not context.args[0].isdigit():
             await update.message.reply_text("❌ Используйте: /approve <ID пользователя>")
             return
@@ -491,7 +503,7 @@ class TelegramBot:
             await update.message.reply_text(f"✅ Пользователь {user_id} одобрен")
 
         except Exception as e:
-            print(f"Error in approve_user: {e}")
+            logging.error(f"Error in approve_user: {e}")
             await update.message.reply_text("Произошла ошибка при одобрении пользователя.")
 
     async def list_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -526,43 +538,56 @@ class TelegramBot:
 
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
-        await query.answer()  # Acknowledge the callback query
+        await query.answer()
 
         try:
-            # Extract user ID from callback data
             data = query.data.split('_')
-            if data[0] != "approve":
-                return  # Ignore irrelevant callbacks
-
+            action = data[0]
             user_id = data[1]
 
-            # Update the user's status in the CSV file
-            with self.users_lock:
-                users = pd.read_csv(self.users_file)
-                users.loc[users['user_id'] == int(user_id), 'approved'] = True
-                users.to_csv(self.users_file, index=False)
+            if action == "approve":
+                with self.users_lock:
+                    users = pd.read_csv(self.users_file)
+                    users.loc[users['user_id'] == int(user_id), 'approved'] = True
+                    users.to_csv(self.users_file, index=False)
 
-            # Notify the user of approval
-            await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен!")
+                await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен!")
+                if query.message and query.message.text:
+                    await query.edit_message_text(text=f"Пользователь {user_id} одобрен")
+                else:
+                    await query.message.reply_text(f"Пользователь {user_id} одобрен")
 
-            # Edit the original message if it contains text
-            if query.message and query.message.text:
-                await query.edit_message_text(text=f"Пользователь {user_id} одобрен")
-            else:
-                # Handle non-text messages by sending a new message
-                await query.message.reply_text(f"Пользователь {user_id} одобрен")
-
+            elif action == "reject":
+                # Логика отклонения заявки
+                with self.users_lock:
+                    users = pd.read_csv(self.users_file)
+                    if int(user_id) in users['user_id'].values:
+                        # Удаляем пользователя из списка заявок
+                        users = users[users['user_id'] != int(user_id)]
+                        users.to_csv(self.users_file, index=False)
+                await self.bot.send_message(chat_id=user_id, text="❌ Ваш запрос на использование бота отклонён.")
+                if query.message and query.message.text:
+                    await query.edit_message_text(text=f"Пользователь {user_id} отклонён")
+                else:
+                    await query.message.reply_text(f"Пользователь {user_id} отклонён")
         except Exception as e:
-            # Log the error and notify the admin
-            print(f"Error in handle_callback: {e}")
+            logging.error(f"Error in handle_callback: {e}", exc_info=True)
             await query.message.reply_text("Произошла ошибка при обработке запроса.")
 
     async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        users = pd.read_csv(self.users_file)
-        users.loc[users['user_id'] == user_id, 'subscribed'] = False
-        users.to_csv(self.users_file, index=False)
-        await update.message.reply_text("🔕 Вы отписались от уведомлений")
+        user_id = str(update.effective_user.id)
+        with self.users_lock:
+            users = pd.read_csv(self.users_file)
+            user = users[users['user_id'] == int(user_id)]
+            if user.empty:
+                await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
+                return
+            if not user['subscribed'].values[0]:
+                await update.message.reply_text("ℹ Вы уже отписаны от уведомлений.")
+                return
+            users.loc[users['user_id'] == int(user_id), 'subscribed'] = False
+            users.to_csv(self.users_file, index=False)
+        await update.message.reply_text("🔕 Вы отписались от уведомлений!")
 
     async def subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
@@ -595,25 +620,76 @@ class TelegramBot:
         await update.message.reply_text(response)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = """
-        🎮 *Доступные команды* 🎮
-
-        🔹 *Основные*
-        /start - Регистрация в системе
-        /help - Справка по командам
-        /subscribe - Подписаться на уведомления
-        /unsubscribe - Отписаться от уведомлений
-        /history - Топ активных игроков
-
-        🔒 *Административные*
-        /users - Список пользователей (админы)
-        /approve [id] - Одобрить пользователя (админы)
-        /send [id] [сообщение] - Отправить сообщение (админы)
-        """
-        await update.message.reply_text(help_text, parse_mode='Markdown')
+        help_text = (
+            "🎮 <b>Доступные команды</b> 🎮\n\n"
+            "🔹 <b>Основные</b>\n"
+            "/start - Регистрация в системе\n"
+            "/help - Справка по командам\n"
+            "/subscribe - Подписаться на уведомления\n"
+            "/unsubscribe - Отписаться от уведомлений\n"
+            "/history - Топ активных игроков\n\n"
+            "🔒 <b>Административные</b>\n"
+            "/users - Список пользователей (админы)\n"
+            "/approve [id] - Одобрить пользователя (админы)\n"
+            "/send [id] [сообщение] - Отправить сообщение (админы)\n"
+            "/anomalies [скорость] [дистанция] - Проверка аномалий по данным игрока (админы)\n"
+            "/heatmap - Отчёт по топ-5 активным зонам (админы)\n"
+            "/player_report [имя игрока] - Отчёт по времени игрока и активности по зонам (админы)\n"
+        )
+        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ Используйте /help для списка команд")
+
+    async def anomalies(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Команда: /anomalies <скорость> <дистанция>
+        Проверяет аномалии по данным игрока.
+        """
+        if not await self._check_admin(update):
+            return
+
+        if len(context.args) < 2:
+            await update.message.reply_text("❌ Используйте: /anomalies <скорость> <дистанция>")
+            return
+
+        try:
+            speed = float(context.args[0])
+            distance = float(context.args[1])
+        except ValueError:
+            await update.message.reply_text("❌ Проверьте, что скорость и дистанция — числа.")
+            return
+
+        player_data = {"speed": speed, "distance": distance}
+        result = self.analytics.detect_anomalies(player_data)
+        await update.message.reply_text(f"Результат проверки аномалий: {result}")
+
+    async def heatmap(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Команда: /heatmap
+        Генерирует отчёт по топ-5 активным зонам.
+        """
+        if not await self._check_admin(update):
+            return
+
+        result = self.analytics.generate_heatmap_report()
+        await update.message.reply_text(result)
+
+    async def player_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """
+        Команда: /player_report <имя игрока>
+        Отчёт по времени игрока и активности по зонам.
+        """
+        if not await self._check_admin(update):
+            return
+
+        if not context.args:
+            await update.message.reply_text("❌ Используйте: /player_report <имя игрока>")
+            return
+
+        player_name = " ".join(context.args)
+        result = self.analytics.generate_player_report(player_name)
+        await update.message.reply_text(result, parse_mode='Markdown')
 
     def run(self):
         """Запуск бота с явным созданием цикла событий"""
@@ -681,16 +757,31 @@ class NoSos:
             users = pd.read_csv(self.telegram_bot.users_file)
             approved_users = users[users['approved'] & users['subscribed']]
 
-            message = f"""
-            🚨 *{alert.source.upper()}* 🚨
-            _Игрок {alert.metadata['player']} в зоне {alert.metadata['zone']}_
-            🕒 {alert.timestamp.strftime('%Y-%m-%d %H:%M')}
-            """
-            for user_id in approved_users['user_id']:
-                await self.telegram_bot.bot.send_message(chat_id=user_id, text=message, parse_mode='Markdown')
-                await asyncio.sleep(0.5)  # ⏳ Задержка между отправками (500 мс)
+            # Определяем целевую аудиторию
+            if alert.source == "zone_intrusion":
+                recipients = approved_users['user_id'].tolist()
+            else:
+                # Только админы из конфига
+                recipients = self.config['security']['admins']
+
+            # Формируем сообщение
+            message = (
+                f"🚨 *{alert.source.upper()}* 🚨\n"
+                f"_Игрок {alert.metadata.get('player', 'Unknown')}_\n"
+                f"🕒 {alert.timestamp.strftime('%Y-%m-%d %H:%M')}"
+            )
+
+            # Отправка
+            for user_id in recipients:
+                await self.telegram_bot.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                await asyncio.sleep(0.5)
+
         except Exception as e:
-            logging.error(f"Ошибка в асинхронной отправке: {str(e)}")
+            logging.error(f"Ошибка отправки алерта: {str(e)}")
 
     @staticmethod
     def load_config():
