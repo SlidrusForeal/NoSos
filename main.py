@@ -1302,7 +1302,7 @@ class NoSos:
                 interval=2000,
                 cache_frame_data=False
             )
-            ani.save('animation.mp4')  # Сохранить анимацию в файл
+            ani.save('animation.gif', writer='pillow')  # Сохранить анимацию в файл
         finally:
             self.shutdown()
 
