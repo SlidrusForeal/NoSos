@@ -24,8 +24,8 @@ security:
 database:
   filename: "activity.db"
 telegram:
-  token: ${BOT_TOKEN}
-  chat_id: ${ADMIN_CHAT_ID}
+  token: "7998680701:AAFLhnk1YmoKR3HDwct8VBQiPvhz9FOGk7U"
+  chat_id: "833655522"
   admin_commands: ["/approve", "/users"]
 alerts:
   zones:
