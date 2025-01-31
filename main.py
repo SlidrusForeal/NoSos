@@ -1317,17 +1317,16 @@ class NoSos:
 
             self.player_list_text.set_text("\n".join(text_lines))
 
-    def run(self):
-        try:
-            ani = FuncAnimation(
-                self.fig, self.update_plot,
-                interval=2000,
-                cache_frame_data=False
-            )
-            self.fig.canvas.manager.set_window_title(self.window_title)
-            plt.show()
-        finally:
-            self.shutdown()
+        def run(self):
+            try:
+                ani = FuncAnimation(
+                    self.fig, self.update_plot,
+                    interval=2000,
+                    cache_frame_data=False
+                )
+                ani.save('animation.mp4')  # Сохранить анимацию в файл
+            finally:
+                self.shutdown()
 
     def translate(self, key):
         return self.translations[self.language].get(key, key)
