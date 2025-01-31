@@ -36,6 +36,8 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 import asyncio
+import aiohttp
+from parser import parse_player_profile
 
 request = HTTPXRequest()
 
@@ -306,6 +308,7 @@ class AlertManager:
     def get_alert_history(self, limit=50) -> List[Alert]:
         return list(self.alert_history)[-limit:]
 
+
 class SecurityManager:
     def __init__(self, config):
         self.config = config['security']
@@ -319,12 +322,17 @@ class SecurityManager:
         with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(entry)
 
+
 class AnalyticsEngine:
     def __init__(self, monitor):
         self.monitor = monitor
         self.config = monitor.config.get("analytics", {})
         self.max_speed = self.config.get("max_speed", 50)
         self.teleport_threshold = self.config.get("teleport_threshold", 100)
+        self.parser_session = None
+
+    async def init_session(self):
+        self.parser_session = aiohttp.ClientSession()
 
     def detect_anomalies(self, player_data: dict) -> str:
         anomalies = []
@@ -335,7 +343,6 @@ class AnalyticsEngine:
         return " | ".join(anomalies) if anomalies else "Норма"
 
     def generate_heatmap_report(self) -> str:
-        # zone_time может быть как словарь вида {zone: {player: time}} или другой – здесь пример реализации
         zone_activity = {}
         for zone, players in self.monitor.zone_time.items():
             if isinstance(players, dict):
@@ -343,20 +350,90 @@ class AnalyticsEngine:
             else:
                 zone_activity[zone] = players
         sorted_zones = sorted(zone_activity.items(), key=lambda x: x[1], reverse=True)[:5]
-        report_lines = [f"• {zone}: {time // 60} минут" for zone, time in sorted_zones]
+        report_lines = [f"• {zone}: {player_time // 60} минут" for zone, player_time in sorted_zones]
         return "🔥 Топ-5 активных зон:\n" + "\n".join(report_lines)
 
-    def generate_player_report(self, player_name: str) -> str:
+    async def fetch_player_data(self, player_name: str) -> dict:
+        """Получение данных игрока с обработкой ошибок"""
+        try:
+            async with self.parser_session.get(
+                    f'https://serverchichi.online/player/{player_name}',
+                    timeout=aiohttp.ClientTimeout(total=10)
+            ) as response:
+                if response.status != 200:
+                    logging.error(f"HTTP ошибка: {response.status} для {player_name}")
+                    return {}
+
+                html = await response.text()
+                if not html:
+                    logging.warning(f"Пустой HTML для игрока {player_name}")
+                    return {}
+
+                return await parse_player_profile(html) or {}
+
+        except Exception as e:
+            logging.error(f"Ошибка парсинга {player_name}: {str(e)}")
+            return {}
+
+    async def generate_player_report(self, player_name: str) -> str:
+        """Генерация расширенного отчета с использованием parser.py"""
+        base_report = self._generate_base_report(player_name)
+        extended_data = await self.fetch_player_data(player_name)
+
+        report = (
+            f"📊 *Расширенный отчет по игроку* [{player_name}]\n"
+            f"{base_report}\n"
+            "🔍 *Дополнительная информация:*\n"
+        )
+
+        sections = [
+            ("📱 Соцсети", self._format_socials(extended_data)),
+            ("🏅 Роли", self._format_roles(extended_data)),
+            ("📈 Статистика", self._format_stats(extended_data)),
+            ("🃏 РП-карточки", self._format_rp_cards(extended_data)),
+            ("💎 Премиум статус", extended_data.get('player_plus', 'N/A'))
+        ]
+
+        return report + "\n".join(
+            f"• *{title}:* {content}"
+            for title, content in sections if content
+        )
+
+    def _generate_base_report(self, player_name: str) -> str:
+        """Базовая информация из мониторинга"""
         total_time = self.monitor.player_time.get(player_name, 0)
         zone_time = self.monitor.zone_time.get(player_name, {})
-        report = (
-            f"📊 Отчёт по игроку *{player_name}*\n"
-            f"Общее время онлайн: {total_time // 3600} ч. {total_time % 3600 // 60} мин.\n"
-            "Время в зонах:\n"
+
+        return (
+                f"🕒 Общее время онлайн: {total_time // 3600}ч {total_time % 3600 // 60}м\n"
+                "📍 Активность по зонам:\n" +
+                "\n".join(f"  - {zone}: {time // 60}м" for zone, time in zone_time.items())
         )
-        for zone, time in zone_time.items():
-            report += f"• {zone}: {time // 60} мин.\n"
-        return report
+
+    def _format_socials(self, data: dict) -> str:
+        if not data.get('socials'):
+            return "Не указаны"
+        return "\n".join(
+            f"{s['name']}: {s['url']}"
+            for s in data['socials'] if s.get('url')
+        ) or "Не указаны"
+
+    def _format_roles(self, data: dict) -> str:
+        return ", ".join(data.get('roles', [])) or "Нет ролей"
+
+    def _format_stats(self, data: dict) -> str:
+        return "\n".join(data.get('stats', [])) or "Нет статистики"
+
+    def _format_rp_cards(self, data: dict) -> str:
+        if not data.get('rp_cards'):
+            return "Нет карточек"
+        return "\n".join(
+            f"{card['h3']}: {card['p']}"
+            for card in data['rp_cards'][:3]
+        )
+
+    async def refresh_data(self, player_name: str):
+        await self.fetch_player_data(player_name)
 
 class TelegramBot:
     def __init__(self, config, monitor, users_file='users.csv'):
@@ -369,8 +446,6 @@ class TelegramBot:
         self.app = ApplicationBuilder().token(config['telegram']['token']).build()
         self._init_users_file()
         self._register_handlers()
-
-        # Инициализируем модуль аналитики
         self.analytics = AnalyticsEngine(monitor)
 
     def _init_users_file(self):
@@ -402,7 +477,7 @@ class TelegramBot:
     async def _check_admin(self, update: Update) -> bool:
         user_id = str(update.effective_user.id)
         if not self.monitor.security.is_admin(user_id):
-            await update.message.reply_text("⛔ Доступ запрещен!")
+            await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
             return False
         return True
 
@@ -412,36 +487,30 @@ class TelegramBot:
             user_id = user.id
             username = user.username or ""
             avatar = None
-            # Получаем аватарку (если есть)
             user_profile_photos = await context.bot.get_user_profile_photos(user_id, limit=1)
             if user_profile_photos.total_count > 0:
                 avatar = user_profile_photos.photos[0][-1]
 
-            # Потокобезопасное обновление файла пользователей
             with self.users_lock:
                 with open(self.users_file, 'r+', encoding='utf-8') as f:
                     users = pd.read_csv(f)
                     if str(user_id) in users['user_id'].astype(str).values:
-                        await update.message.reply_text(
-                            "🛠 *Вы уже зарегистрированы в системе*",
-                            parse_mode='Markdown'
-                        )
+                        await update.message.reply_text("🛠 Вы уже зарегистрированы", parse_mode='Markdown')
                         return
-                    normalized_name = self._normalize_name(username) if username else ""
+
                     new_user = pd.DataFrame([[
                         user_id,
-                        normalized_name,
-                        False,  # approved
-                        True    # subscribed
+                        self._normalize_name(username),
+                        False,
+                        True
                     ]], columns=users.columns)
+
                     users = pd.concat([users, new_user], ignore_index=True)
                     f.seek(0)
                     users.to_csv(f, index=False)
 
-            await update.message.reply_text(
-                "✅ *Ваш запрос отправлен администратору*",
-                parse_mode='Markdown'
-            )
+            await update.message.reply_text("✅ Запрос отправлен администратору", parse_mode='Markdown')
+
             admin_text = (
                 f"👤 *Новый запрос на доступ*\n"
                 f"🆔 ID: `{user_id}`\n"
@@ -454,6 +523,7 @@ class TelegramBot:
                     InlineKeyboardButton("❌ Отклонить", callback_data=f"reject_{user_id}")
                 ]
             ]
+
             if avatar:
                 await context.bot.send_photo(
                     chat_id=self.admin_id,
@@ -469,13 +539,13 @@ class TelegramBot:
                     reply_markup=InlineKeyboardMarkup(keyboard),
                     parse_mode='Markdown'
                 )
+
         except Exception as e:
             logging.error(f"Ошибка в команде /start: {str(e)}", exc_info=True)
             await update.message.reply_text(
                 "⚠️ *Произошла ошибка при обработке запроса*",
                 parse_mode='Markdown'
             )
-
     async def approve_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_admin(update):
             await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
@@ -532,7 +602,8 @@ class TelegramBot:
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
-    async def caramel_pain_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    @staticmethod
+    async def caramel_pain_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         responses = ["Кто такие мышериоты?", "La-Li-Lu-Le-Lo", "Shin Sei Moku Roku"]
         await update.message.reply_text(f"🔐 {random.choice(responses)}")
 
@@ -543,36 +614,102 @@ class TelegramBot:
         try:
             data = query.data.split('_')
             action = data[0]
-            user_id = data[1]
+
+            if action in ("approve", "reject"):
+                await self._handle_admin_action(query, data)
+            elif action == "report":
+                await self._handle_report_action(query, data)
+
+        except Exception as e:
+            logging.error(f"Callback error: {str(e)}")
+            await query.message.reply_text("⚠ Ошибка обработки запроса")
+
+    async def _handle_admin_action(self, query, data):
+        action, user_id = data[0], data[1]
+
+        with self.users_lock:
+            users = pd.read_csv(self.users_file)
 
             if action == "approve":
-                with self.users_lock:
-                    users = pd.read_csv(self.users_file)
-                    users.loc[users['user_id'] == int(user_id), 'approved'] = True
-                    users.to_csv(self.users_file, index=False)
+                users.loc[users['user_id'] == int(user_id), 'approved'] = True
+                await self.bot.send_message(user_id, "✅ Ваш аккаунт одобрен!")
+                response = f"Пользователь {user_id} одобрен"
+            else:
+                users = users[users['user_id'] != int(user_id)]
+                await self.bot.send_message(user_id, "❌ Ваш запрос отклонён")
+                response = f"Пользователь {user_id} отклонён"
 
-                await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен!")
-                if query.message and query.message.text:
-                    await query.edit_message_text(text=f"Пользователь {user_id} одобрен")
-                else:
-                    await query.message.reply_text(f"Пользователь {user_id} одобрен")
+            users.to_csv(self.users_file, index=False)
 
-            elif action == "reject":
-                # Логика отклонения заявки
-                with self.users_lock:
-                    users = pd.read_csv(self.users_file)
-                    if int(user_id) in users['user_id'].values:
-                        # Удаляем пользователя из списка заявок
-                        users = users[users['user_id'] != int(user_id)]
-                        users.to_csv(self.users_file, index=False)
-                await self.bot.send_message(chat_id=user_id, text="❌ Ваш запрос на использование бота отклонён.")
-                if query.message and query.message.text:
-                    await query.edit_message_text(text=f"Пользователь {user_id} отклонён")
-                else:
-                    await query.message.reply_text(f"Пользователь {user_id} отклонён")
-        except Exception as e:
-            logging.error(f"Error in handle_callback: {e}", exc_info=True)
-            await query.message.reply_text("Произошла ошибка при обработке запроса.")
+        await query.edit_message_text(text=response)
+
+    async def _handle_report_action(self, query, data):
+        report_type = data[1]
+        player_name = "_".join(data[2:])
+
+        handlers = {
+            'base': self._send_base_report,
+            'social': self._send_social_report,
+            'full': self._send_full_report,
+            'refresh': self._refresh_report
+        }
+
+        if report_type in handlers:
+            await handlers[report_type](query, player_name)
+
+    async def _send_base_report(self, query, player_name):
+        report = self.analytics._generate_base_report(player_name)
+        await self._edit_report(query, report)
+
+    async def _send_social_report(self, query, player_name):
+        data = await self.analytics.fetch_player_data(player_name)
+
+        socials = self.analytics.format_socials(data) if data else "Данные недоступны"
+        roles = self.analytics.format_roles(data) if data else "Данные недоступны"
+
+        report = (
+            "📱 *Социальные сети:*\n"
+            f"{socials}\n\n"
+            "🏅 *Роли:*\n"
+            f"{roles}"
+        )
+        await self._edit_report(query, report)
+
+    async def _send_full_report(self, query, player_name):
+        report = await self.analytics.generate_player_report(player_name)
+        await self._edit_report(query, report)
+
+    async def _refresh_report(self, query, player_name):
+        await query.message.reply_text("🔄 Обновление данных...")
+        await self.analytics.refresh_data(player_name)  # Используем правильное имя метода
+        report = await self.analytics.generate_player_report(player_name)
+        await self._edit_report(query, f"{report}\n✅ Данные обновлены")
+
+    async def _edit_report(self, query, text):
+        await query.edit_message_text(
+            text=text,
+            parse_mode='Markdown',
+            reply_markup=query.message.reply_markup
+        )
+
+    async def player_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not context.args:
+            await update.message.reply_text("❌ Укажите имя игрока")
+            return
+
+        player_name = " ".join(context.args)
+        keyboard = [
+            [InlineKeyboardButton("Основная статистика", callback_data=f"report_base_{player_name}")],
+            [InlineKeyboardButton("Соцсети и роли", callback_data=f"report_social_{player_name}")],
+            [InlineKeyboardButton("Полный отчёт", callback_data=f"report_full_{player_name}")],
+            [InlineKeyboardButton("Обновить данные", callback_data=f"report_refresh_{player_name}")]
+        ]
+
+        await update.message.reply_text(
+            f"Отчёт для *{player_name}*:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+            parse_mode='Markdown'
+        )
 
     async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
@@ -619,7 +756,8 @@ class TelegramBot:
 
         await update.message.reply_text(response)
 
-    async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    @staticmethod
+    async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         help_text = (
             "🎮 <b>Доступные команды</b> 🎮\n\n"
             "🔹 <b>Основные</b>\n"
@@ -638,7 +776,8 @@ class TelegramBot:
         )
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
-    async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    @staticmethod
+    async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ Используйте /help для списка команд")
 
     async def anomalies(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -675,26 +814,8 @@ class TelegramBot:
         result = self.analytics.generate_heatmap_report()
         await update.message.reply_text(result)
 
-    async def player_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Команда: /player_report <имя игрока>
-        Отчёт по времени игрока и активности по зонам.
-        """
-        if not await self._check_admin(update):
-            return
-
-        if not context.args:
-            await update.message.reply_text("❌ Используйте: /player_report <имя игрока>")
-            return
-
-        player_name = " ".join(context.args)
-        result = self.analytics.generate_player_report(player_name)
-        await update.message.reply_text(result, parse_mode='Markdown')
-
-    def run(self):
-        """Запуск бота с явным созданием цикла событий"""
-        asyncio.set_event_loop(asyncio.new_event_loop())
-        self.app.run_polling()
+    async def initialize(self):
+        await self.analytics.init_session()
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -702,6 +823,12 @@ class TelegramBot:
         """Нормализует имя для callback_data"""
         name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
         return re.sub(r'[^a-zA-Z0-9_]', '', name).lower()
+
+    def run(self):
+        """Запуск бота с явным созданием цикла событий"""
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        self.app.run_polling()
+
 class NoSos:
     def __init__(self):
         self.config = self.load_config()
@@ -747,7 +874,8 @@ class NoSos:
         except Exception as e:
             logging.error(f"Ошибка отправки уведомления: {str(e)}")
 
-    def _run_loop(self, loop):
+    @staticmethod
+    def _run_loop(loop):
         """Функция для запуска event loop в отдельном потоке"""
         asyncio.set_event_loop(loop)
         loop.run_forever()
@@ -835,7 +963,6 @@ class NoSos:
         filename = db_config.get('filename', 'activity.db')
         self.conn = sqlite3.connect(filename, check_same_thread=False)
         self.create_tables()
-
 
     def start_db_handler(self):
         def db_handler():
@@ -1033,7 +1160,9 @@ class NoSos:
             alert_text = f"⚠ {alert.message} ⚠"
             if alert_text not in current_messages:
                 self.show_alert(alert)
-    def safe_remove(self, artist) -> bool:
+
+    @staticmethod
+    def safe_remove(artist) -> bool:
         """Безопасное удаление художника с возвратом статуса успеха"""
         try:
             artist.remove()
@@ -1158,6 +1287,7 @@ class NoSos:
         except Exception as e:
             logging.error(f"Ошибка обновления графика: {str(e)}")
             return self.ax
+
     def draw_players(self):
         with self.data_lock:
             filtered = self.current_data
@@ -1270,14 +1400,13 @@ class NoSos:
 
     def get_top_players(self, top_n=10):
         return sorted(self.player_time.items(),
-                     key=lambda x: x[1], reverse=True)[:top_n]
+                      key=lambda x: x[1], reverse=True)[:top_n]
 
     def get_zone_statistics(self):
         stats = {}
         for zone, players in self.zone_time.items():
             stats[zone] = sum(players.values())
         return stats
-
 
     def plot_activity_by_hour(self):
         hours = list(range(24))
@@ -1292,15 +1421,15 @@ class NoSos:
         plt.grid(True)
         plt.show()
 
-    def export_data(self, format='csv'):
+    def export_data(self, fileformat='csv'):
         try:
-            if format == 'csv':
+            if fileformat == 'csv':
                 self.export_to_csv()
-            elif format == 'json':
+            elif fileformat == 'json':
                 self.export_to_json()
-            elif format == 'excel':
+            elif fileformat == 'excel':
                 self.export_to_excel()
-            elif format == 'player_zone_time':
+            elif fileformat == 'player_zone_time':
                 self.export_player_zone_time()  # Новый метод для экспорта времени игроков в зонах
         except Exception as e:
             logging.error(f"Export error: {str(e)}")
@@ -1328,15 +1457,15 @@ class NoSos:
         with open('player_activity.csv', 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Player', 'Total Time'])
-            for player, time in self.player_time.items():
-                writer.writerow([player, time])
+            for player, Player_time in self.player_time.items():
+                writer.writerow([player, Player_time])
 
         # Экспорт статистики по зонам
         with open('zone_stats.csv', 'w', newline='') as f:
             writer = csv.writer(f)
             writer.writerow(['Zone', 'Total Time'])
-            for zone, time in self.get_zone_statistics().items():
-                writer.writerow([zone, time])
+            for zone, Player_time in self.get_zone_statistics().items():
+                writer.writerow([zone, Player_time])
 
     def export_to_json(self):
         data = {
