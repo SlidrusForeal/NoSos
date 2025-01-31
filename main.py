@@ -387,6 +387,20 @@ class TelegramBot:
         if not os.path.exists(self.users_file):
             with open(self.users_file, 'w', encoding='utf-8') as f:
                 f.write("user_id,username,approved,subscribed\n")
+        else:
+            # Проверяем наличие колонки 'subscribed' и добавляем при необходимости
+            with open(self.users_file, 'r+', encoding='utf-8') as f:
+                lines = f.readlines()
+                if lines:
+                    headers = lines[0].strip().split(',')
+                    if 'subscribed' not in headers:
+                        # Добавляем колонку 'subscribed' с дефолтным значением False
+                        new_lines = [lines[0].strip() + ',subscribed\n']
+                        for line in lines[1:]:
+                            new_lines.append(line.strip() + ',False\n')
+                        f.seek(0)
+                        f.writelines(new_lines)
+                        f.truncate()
 
     def _register_handlers(self):
         handlers = [
@@ -610,6 +624,11 @@ class TelegramBot:
         user_id = str(update.effective_user.id)
         with self.users_lock:
             users = pd.read_csv(self.users_file)
+            
+            # Добавляем колонку 'subscribed', если её нет
+            if 'subscribed' not in users.columns:
+                users['subscribed'] = False
+            
             user = users[users['user_id'] == int(user_id)]
             if user.empty:
                 await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
@@ -625,6 +644,11 @@ class TelegramBot:
         user_id = str(update.effective_user.id)
         with self.users_lock:
             users = pd.read_csv(self.users_file)
+            
+            # Добавляем колонку 'subscribed', если её нет
+            if 'subscribed' not in users.columns:
+                users['subscribed'] = False
+            
             user = users[users['user_id'] == int(user_id)]
             if user.empty:
                 await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
