@@ -18,11 +18,16 @@ from enum import Enum, auto
 from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
 
+import matplotlib
+matplotlib.use('Qt5Agg')
+from PyQt5 import QtGui
+
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import yaml
 from matplotlib.animation import FuncAnimation
+from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 import threading
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -36,6 +41,8 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 import asyncio
+from io import BytesIO
+from PIL import Image
 
 request = HTTPXRequest()
 
@@ -306,6 +313,7 @@ class AlertManager:
     def get_alert_history(self, limit=50) -> List[Alert]:
         return list(self.alert_history)[-limit:]
 
+
 class SecurityManager:
     def __init__(self, config):
         self.config = config['security']
@@ -318,6 +326,7 @@ class SecurityManager:
         entry = f"{datetime.now().isoformat()} | {event_type} | User: {user_id} | Command: {command}\n"
         with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(entry)
+
 
 class AnalyticsEngine:
     def __init__(self, monitor):
@@ -357,6 +366,7 @@ class AnalyticsEngine:
         for zone, time in zone_time.items():
             report += f"• {zone}: {time // 60} мин.\n"
         return report
+
 
 class TelegramBot:
     def __init__(self, config, monitor, users_file='users.csv'):
@@ -402,7 +412,7 @@ class TelegramBot:
     async def _check_admin(self, update: Update) -> bool:
         user_id = str(update.effective_user.id)
         if not self.monitor.security.is_admin(user_id):
-            await update.message.reply_text("⛔ Доступ запрещен!")
+            await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
             return False
         return True
 
@@ -432,7 +442,7 @@ class TelegramBot:
                         user_id,
                         normalized_name,
                         False,  # approved
-                        True    # subscribed
+                        True  # subscribed
                     ]], columns=users.columns)
                     users = pd.concat([users, new_user], ignore_index=True)
                     f.seek(0)
@@ -501,6 +511,16 @@ class TelegramBot:
 
             await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен администратором!")
             await update.message.reply_text(f"✅ Пользователь {user_id} одобрен")
+            await self.bot.send_message(
+                chat_id=user_id,
+                text="✅ <b>Ваш аккаунт одобрен!</b>\n\n"
+                     "Теперь вам доступны команды:\n"
+                     "/help - Справка\n"
+                     "/subscribe - Подписка\n"
+                     "/unsubscribe - Отписка\n"
+                     "/history - Топ игроков\n",
+                parse_mode=ParseMode.HTML
+            )
 
         except Exception as e:
             logging.error(f"Error in approve_user: {e}")
@@ -552,6 +572,17 @@ class TelegramBot:
                     users.to_csv(self.users_file, index=False)
 
                 await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен!")
+                await self.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ <b>Одобрено!</b>\n\n"
+                         "Доступные команды:\n"
+                         "/help - Помощь\n"
+                         "/subscribe - Уведомления\n"
+                         "/unsubscribe - Отмена\n"
+                         "/history - Активность\n"
+                         "/caramel_pain - Тайна",
+                    parse_mode=ParseMode.HTML
+                )
                 if query.message and query.message.text:
                     await query.edit_message_text(text=f"Пользователь {user_id} одобрен")
                 else:
@@ -620,22 +651,17 @@ class TelegramBot:
         await update.message.reply_text(response)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        help_text = (
-            "🎮 <b>Доступные команды</b> 🎮\n\n"
-            "🔹 <b>Основные</b>\n"
-            "/start - Регистрация в системе\n"
-            "/help - Справка по командам\n"
-            "/subscribe - Подписаться на уведомления\n"
-            "/unsubscribe - Отписаться от уведомлений\n"
-            "/history - Топ активных игроков\n\n"
-            "🔒 <b>Административные</b>\n"
-            "/users - Список пользователей (админы)\n"
-            "/approve [id] - Одобрить пользователя (админы)\n"
-            "/send [id] [сообщение] - Отправить сообщение (админы)\n"
-            "/anomalies [скорость] [дистанция] - Проверка аномалий по данным игрока (админы)\n"
-            "/heatmap - Отчёт по топ-5 активным зонам (админы)\n"
-            "/player_report [имя игрока] - Отчёт по времени игрока и активности по зонам (админы)\n"
-        )
+        user_id = str(update.effective_user.id)
+        is_admin = self.monitor.security.is_admin(user_id)
+
+        help_text = "🛠 <b>Доступные команды</b>\n\n"
+        help_text += "<b>Основные:</b>\n"
+        help_text += "/help - Справка\n/subscribe - Подписка\n/unsubscribe - Отписка\n/history - Топ игроков\n\n"
+
+        if is_admin:
+            help_text += "<b>Админ:</b>\n"
+            help_text += "/users - Список\n/approve - Одобрить\n/send - Сообщение\n/anomalies - Проверка\n/heatmap - Зоны\n/player_report - Отчёт\n"
+
         await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
 
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -702,8 +728,12 @@ class TelegramBot:
         """Нормализует имя для callback_data"""
         name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
         return re.sub(r'[^a-zA-Z0-9_]', '', name).lower()
+
+
 class NoSos:
     def __init__(self):
+        self.window_title = "NoSos"
+        self.icon_path = "icon.ico"
         self.config = self.load_config()
         self.security = SecurityManager(self.config)
         self.telegram_bot = TelegramBot(self.config, self)
@@ -798,10 +828,25 @@ class NoSos:
 
     def setup_plot(self):
         plt.style.use('dark_background')
-        self.fig = plt.figure(figsize=(16, 10))
+        self.fig = plt.figure(
+            figsize=(16, 10),
+            num=self.window_title
+        )
         self.ax = self.fig.add_subplot(111)
         self.fig.subplots_adjust(right=0.7, left=0.05)
         self.setup_controls()
+
+        try:
+            if plt.get_backend().lower() == 'tkagg':
+                manager = plt.get_current_fig_manager()
+                manager.window.wm_iconbitmap(self.icon_path)
+            elif plt.get_backend().lower() == 'qt5agg':
+                manager = plt.get_current_fig_manager()
+                manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
+        except Exception as e:
+            logging.error(f"Ошибка установки иконки: {str(e)}")
+
+        self.ax = self.fig.add_subplot(111)
 
     def setup_controls(self):
         self.player_list_ax = self.fig.add_axes([0.72, 0.25, 0.25, 0.70])
@@ -835,7 +880,6 @@ class NoSos:
         filename = db_config.get('filename', 'activity.db')
         self.conn = sqlite3.connect(filename, check_same_thread=False)
         self.create_tables()
-
 
     def start_db_handler(self):
         def db_handler():
@@ -1033,6 +1077,7 @@ class NoSos:
             alert_text = f"⚠ {alert.message} ⚠"
             if alert_text not in current_messages:
                 self.show_alert(alert)
+
     def safe_remove(self, artist) -> bool:
         """Безопасное удаление художника с возвратом статуса успеха"""
         try:
@@ -1158,28 +1203,62 @@ class NoSos:
         except Exception as e:
             logging.error(f"Ошибка обновления графика: {str(e)}")
             return self.ax
+
     def draw_players(self):
         with self.data_lock:
             filtered = self.current_data
 
         if filtered:
-            x = [p["position"]["x"] for p in filtered]
-            z = [p["position"]["z"] for p in filtered]
-
-            self.ax.scatter(
-                x, z,
-                s=self.config["display"]["point_size"],
-                c=self.config["display"]["point_color"],
-                alpha=self.config["display"]["point_alpha"],
-                edgecolors='none',
-                zorder=10
-            )
-
+            head_cache = {}
             label_config = self.config["display"]["labels"]
+
+            # Загрузка всех изображений заранее
             for player in filtered:
+                username = player['name']
+                if username not in head_cache:
+                    try:
+                        response = requests.get(
+                            f"https://serverchichi.online/api/getHead/{username}.png",
+                            timeout=3
+                        )
+                        img = Image.open(BytesIO(response.content))
+                        head_cache[username] = img
+                    except Exception as e:
+                        head_cache[username] = None
+
+            # Отрисовка элементов в правильном порядке
+            for player in filtered:
+                x = player['position']['x']
+                z = player['position']['z']
+                username = player['name']
+                img = head_cache.get(username)
+
+                # 1. Отрисовка голов/точек (нижний слой)
+                if img:
+                    img_array = np.array(img)
+                    imagebox = OffsetImage(img_array, zoom=0.15)
+                    ab = AnnotationBbox(
+                        imagebox,
+                        (x, z),
+                        frameon=False,
+                        pad=0,
+                        zorder=10  # Головы под метками, но над фоном
+                    )
+                    self.ax.add_artist(ab)
+                else:
+                    self.ax.scatter(
+                        x, z,
+                        s=self.config["display"]["point_size"],
+                        c=self.config["display"]["point_color"],
+                        alpha=self.config["display"]["point_alpha"],
+                        edgecolors='none',
+                        zorder=10
+                    )
+
+                # 2. Отрисовка меток (верхний слой)
                 text = self.ax.annotate(
-                    player['name'],
-                    xy=(player['position']['x'], player['position']['z']),
+                    username,
+                    xy=(x, z),
                     xytext=(0, label_config["y_offset"]),
                     textcoords='offset points',
                     color=label_config["text_color"],
@@ -1192,7 +1271,7 @@ class NoSos:
                         edgecolor='none',
                         alpha=label_config["bg_alpha"]
                     ),
-                    zorder=11
+                    zorder=20  # Метки поверх всех элементов
                 )
                 self.label_objects.append(text)
 
@@ -1221,6 +1300,7 @@ class NoSos:
             )
 
     def setup_labels(self):
+        self.ax.set_zorder(10)
         self.ax.set_xlim(self.world_bounds[0], self.world_bounds[1])
         self.ax.set_ylim(self.world_bounds[2], self.world_bounds[3])
         self.ax.set_title(f"Карта активности игроков ({datetime.now().strftime('%H:%M:%S')})",
@@ -1245,6 +1325,7 @@ class NoSos:
                 interval=2000,
                 cache_frame_data=False
             )
+            self.fig.canvas.manager.set_window_title(self.window_title)
             plt.show()
         finally:
             self.shutdown()
@@ -1270,14 +1351,13 @@ class NoSos:
 
     def get_top_players(self, top_n=10):
         return sorted(self.player_time.items(),
-                     key=lambda x: x[1], reverse=True)[:top_n]
+                      key=lambda x: x[1], reverse=True)[:top_n]
 
     def get_zone_statistics(self):
         stats = {}
         for zone, players in self.zone_time.items():
             stats[zone] = sum(players.values())
         return stats
-
 
     def plot_activity_by_hour(self):
         hours = list(range(24))
