@@ -20,6 +20,7 @@ from typing import Dict, Any, List, Tuple, Optional
 
 import matplotlib
 matplotlib.use('Qt5Agg')
+matplotlib.use('Agg')
 from PyQt5 import QtGui
 
 import matplotlib.pyplot as plt
