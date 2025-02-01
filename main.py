@@ -18,16 +18,11 @@ from enum import Enum, auto
 from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
 
-import matplotlib
-matplotlib.use('Qt5Agg')
-from PyQt5 import QtGui
-
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
 import yaml
 from matplotlib.animation import FuncAnimation
-from matplotlib.offsetbox import OffsetImage, AnnotationBbox
 import threading
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -41,8 +36,6 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 import asyncio
-from io import BytesIO
-from PIL import Image
 
 request = HTTPXRequest()
 
@@ -69,7 +62,7 @@ class Alert:
     source: str
     timestamp: datetime
     metadata: Dict[str, Any] = None
-    cooldown: float = 60  # Добавлено поле cooldown
+    cooldown: float = 60
 
 
 class BaseAlertRule(ABC):
@@ -93,9 +86,9 @@ class BaseAlertRule(ABC):
 class MovementAnomalyRule(BaseAlertRule):
     def __init__(self, config: Dict[str, Any]):
         super().__init__(config)
-        self.max_speed = config.get("max_speed", 50)  # Блоков в секунду
+        self.max_speed = config.get("max_speed", 50)
         self.teleport_threshold = config.get("teleport_threshold", 100)
-        self.player_positions: Dict[str, Tuple[Tuple[float, float], float]] = {}  # История позиций игроков
+        self.player_positions: Dict[str, Tuple[Tuple[float, float], float]] = {}
 
     def check_conditions(self, data: Dict) -> List[Alert]:
         alerts = []
@@ -111,11 +104,9 @@ class MovementAnomalyRule(BaseAlertRule):
                     self._update_player_history(player_id, current_pos, current_time)
                     continue
 
-                # Рассчет расстояния и времени
                 distance = self._calculate_distance(last_pos, current_pos)
                 time_diff = current_time - last_time
 
-                # Проверка на аномалии
                 if time_diff > 0:
                     speed = distance / time_diff
                     if speed > self.max_speed:
@@ -136,11 +127,9 @@ class MovementAnomalyRule(BaseAlertRule):
         return alerts
 
     def _get_player_history(self, player_id: str) -> Tuple[Optional[Tuple[float, float]], float]:
-        """Получение последней зафиксированной позиции игрока"""
         return self.player_positions.get(player_id, (None, 0.0))
 
     def _update_player_history(self, player_id: str, pos: Tuple[float, float], timestamp: float):
-        """Обновление истории позиций игрока"""
         self.player_positions[player_id] = (pos, timestamp)
 
     @staticmethod
@@ -158,7 +147,7 @@ class MovementAnomalyRule(BaseAlertRule):
                 "speed": speed,
                 "position": player["position"]
             },
-            cooldown=self.cooldown  # Установка cooldown из правила
+            cooldown=self.cooldown
         )
 
     def _create_teleport_alert(self, player: Dict, distance: float) -> Alert:
@@ -185,7 +174,6 @@ class ZoneIntrusionRule(BaseAlertRule):
     @staticmethod
     @lru_cache(maxsize=1000)
     def _normalize_name(name: str) -> str:
-        """Нормализует имя для callback_data"""
         name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
         return re.sub(r'[^a-zA-Z0-9_]', '', name).lower()
 
@@ -202,6 +190,7 @@ class ZoneIntrusionRule(BaseAlertRule):
         alerts = []
         zone_name = self.config["name"]
         allowed = {self._normalize_name(p) for p in self.config.get("allowed_players", [])}
+        intruders = []
 
         for player in data.get("players", []):
             pos = player.get("position", {})
@@ -214,25 +203,28 @@ class ZoneIntrusionRule(BaseAlertRule):
             if norm_name in allowed:
                 continue
 
-            alert_id = f"{zone_name}_{norm_name}"
+            intruders.append(player.get('name', 'Unknown'))
+
+        if intruders:
+            alert_id = f"{zone_name}_intrusion"
             if self._should_trigger(alert_id):
-                alerts.append(self._create_alert(player, zone_name, x, z))
+                alerts.append(self._create_alert(zone_name, intruders))
                 self._update_cooldown(alert_id)
 
         return alerts
 
-    def _create_alert(self, player: Dict, zone_name: str, x: float, z: float) -> Alert:
+    def _create_alert(self, zone_name: str, players: List[str]) -> Alert:
         return Alert(
-            message=f"Игрок {player.get('name', 'Unknown')} в зоне {zone_name}",
+            message=f"Обнаружены игроки в зоне {zone_name}",
             level=self.alert_level,
             source="zone_intrusion",
             timestamp=datetime.now(),
             metadata={
-                "player": player.get('name'),
                 "zone": zone_name,
-                "coordinates": (x, z)
+                "players": players,
+                "count": len(players)
             },
-            cooldown=self.cooldown  # Установка cooldown из правила
+            cooldown=self.cooldown
         )
 
 
@@ -256,7 +248,6 @@ class AlertManager:
         self.alert_history = deque(maxlen=1000)
 
     def get_active_alerts(self) -> List[Alert]:
-        """Возвращает список активных алертов"""
         return list(self.active_alerts.values())
 
     @lru_cache(maxsize=100)
@@ -327,7 +318,6 @@ class SecurityManager:
         with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(entry)
 
-
 class AnalyticsEngine:
     def __init__(self, monitor):
         self.monitor = monitor
@@ -368,19 +358,22 @@ class AnalyticsEngine:
         return report
 
 
+
 class TelegramBot:
     def __init__(self, config, monitor, users_file='users.csv'):
         self.users_lock = threading.Lock()
+        self.track_lock = threading.Lock()
         self.monitor = monitor
         self.config = config
         self.users_file = users_file
         self.admin_id = str(config['telegram']['chat_id'])
         self.bot = Bot(token=config['telegram']['token'])
         self.app = ApplicationBuilder().token(config['telegram']['token']).build()
+        self.tracked_players = defaultdict(set)  # {player_name: {user_ids}}
+        self.player_history = defaultdict(lambda: {"x": 0, "z": 0})  # Последние координаты
         self._init_users_file()
         self._register_handlers()
 
-        # Инициализируем модуль аналитики
         self.analytics = AnalyticsEngine(monitor)
 
     def _init_users_file(self):
@@ -399,7 +392,8 @@ class TelegramBot:
             CommandHandler("caramel_pain", self.caramel_pain_command),
             CommandHandler("history", self.history),
             CommandHandler("subscribe", self.subscribe),
-            # Новые команды для аналитики (только для админа)
+            CommandHandler("track", self.track_player),
+            CommandHandler("untrack", self.untrack_player),
             CommandHandler("anomalies", self.anomalies),
             CommandHandler("heatmap", self.heatmap),
             CommandHandler("player_report", self.player_report),
@@ -415,6 +409,49 @@ class TelegramBot:
             await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
             return False
         return True
+
+    async def track_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Подписаться на уведомления о перемещениях игрока"""
+        user_id = str(update.effective_user.id)
+
+        if not context.args:
+            await update.message.reply_text("❌ Укажите ник игрока: /track <ник>")
+            return
+
+        player_name = " ".join(context.args).strip()
+
+        # Проверка прав доступа
+        with self.users_lock:
+            users = pd.read_csv(self.users_file)
+            user = users[users['user_id'] == int(user_id)]
+            if user.empty or not user['approved'].values[0]:
+                await update.message.reply_text("⛔️ Доступ запрещен!")
+                return
+
+        with self.track_lock:
+            self.tracked_players[player_name.lower()].add(user_id)
+
+        await update.message.reply_text(
+            f"🔭 Вы подписались на перемещения игрока {player_name}\n"
+            f"Используйте /untrack {player_name} для отмены"
+        )
+
+    async def untrack_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Отписаться от трекинга"""
+        user_id = str(update.effective_user.id)
+
+        if not context.args:
+            await update.message.reply_text("❌ Укажите ник игрока: /untrack <ник>")
+            return
+
+        player_name = " ".join(context.args).strip().lower()
+
+        with self.track_lock:
+            if user_id in self.tracked_players.get(player_name, set()):
+                self.tracked_players[player_name].remove(user_id)
+                await update.message.reply_text(f"✅ Вы отписались от {player_name}")
+            else:
+                await update.message.reply_text("ℹ️ Вы не отслеживаете этого игрока")
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         try:
@@ -579,8 +616,7 @@ class TelegramBot:
                          "/help - Помощь\n"
                          "/subscribe - Уведомления\n"
                          "/unsubscribe - Отмена\n"
-                         "/history - Активность\n"
-                         "/caramel_pain - Тайна",
+                         "/history - Активность",
                     parse_mode=ParseMode.HTML
                 )
                 if query.message and query.message.text:
@@ -656,7 +692,8 @@ class TelegramBot:
 
         help_text = "🛠 <b>Доступные команды</b>\n\n"
         help_text += "<b>Основные:</b>\n"
-        help_text += "/help - Справка\n/subscribe - Подписка\n/unsubscribe - Отписка\n/history - Топ игроков\n\n"
+        help_text += "/help - Справка\n/subscribe - Подписка\n/unsubscribe - Отписка\n"
+        help_text += "/history - Топ игроков\n/track (ник) - Трекинг игрока\n/untrack (ник) - Остановить трекинг\n\n"
 
         if is_admin:
             help_text += "<b>Админ:</b>\n"
@@ -719,7 +756,8 @@ class TelegramBot:
 
     def run(self):
         """Запуск бота с явным созданием цикла событий"""
-        asyncio.set_event_loop(asyncio.new_event_loop())
+        self.app._loop = asyncio.new_event_loop()  # <-- Добавлено
+        asyncio.set_event_loop(self.app._loop)
         self.app.run_polling()
 
     @staticmethod
@@ -732,11 +770,13 @@ class TelegramBot:
 
 class NoSos:
     def __init__(self):
-        self.window_title = "NoSos"
-        self.icon_path = "icon.ico"
+        self.stop_event = threading.Event()  # Инициализация stop_event здесь
         self.config = self.load_config()
+        self.admin_id = str(self.config["telegram"]["chat_id"])
+        self.init_temp_db()
         self.security = SecurityManager(self.config)
         self.telegram_bot = TelegramBot(self.config, self)
+        self.bot = self.telegram_bot.bot
         self.world_bounds = (
             self.config["world_bounds"]["xmin"],
             self.config["world_bounds"]["xmax"],
@@ -751,6 +791,8 @@ class NoSos:
         self.db_queue = queue.Queue()
         self.gui_update_queue = queue.Queue()
         self.gui_queue = queue.Queue()
+        self.temp_db_queue = queue.Queue()
+        self.start_temp_db_handler()
         self.alert_texts = []
 
         self.alert_manager = AlertManager()
@@ -763,16 +805,30 @@ class NoSos:
         self.start_db_handler()
         self.load_translations()
         threading.Thread(target=self.telegram_bot.run, daemon=True).start()
+        self.start_cleanup_thread()
+
+    def start_cleanup_thread(self):
+        """Поток для очистки устаревших данных"""
+        def cleanup_worker():
+            while not self.stop_event.is_set():
+                try:
+                    cursor = self.temp_conn.cursor()
+                    # Удаляем записи старше 30 дней
+                    cursor.execute('''
+                        DELETE FROM player_movements 
+                        WHERE timestamp < datetime('now', '-30 days')
+                    ''')
+                    self.temp_conn.commit()
+                    time.sleep(3600)  # Каждый час
+                except Exception as e:
+                    logging.error(f"Cleanup error: {str(e)}")
+
+        threading.Thread(target=cleanup_worker, daemon=True).start()
 
     def send_notifications(self, alert: Alert):
         try:
-            loop = None
-            try:
-                loop = asyncio.get_running_loop()  # Получаем текущий event loop
-            except RuntimeError:
-                loop = asyncio.new_event_loop()  # Создаем новый event loop, если его нет
-                threading.Thread(target=self._run_loop, args=(loop,), daemon=True).start()
-
+            # Получаем loop из Application, а не из Bot
+            loop = self.telegram_bot.app._loop  # <-- Исправлено
             asyncio.run_coroutine_threadsafe(self._async_send_alert(alert), loop)
         except Exception as e:
             logging.error(f"Ошибка отправки уведомления: {str(e)}")
@@ -782,36 +838,219 @@ class NoSos:
         asyncio.set_event_loop(loop)
         loop.run_forever()
 
+    def start_temp_db_handler(self):
+        """Обработчик задач для временной БД"""
+        def handler():
+            while not self.stop_event.is_set():
+                try:
+                    task = self.temp_db_queue.get(timeout=1)
+                    if task:
+                        task()
+                except queue.Empty:
+                    continue
+                except Exception as e:
+                    logging.error(f"Temp DB handler error: {str(e)}")
+
+        threading.Thread(target=handler, daemon=True).start()
+
     async def _async_send_alert(self, alert: Alert):
         try:
-            users = pd.read_csv(self.telegram_bot.users_file)
-            approved_users = users[users['approved'] & users['subscribed']]
-
-            # Определяем целевую аудиторию
             if alert.source == "zone_intrusion":
-                recipients = approved_users['user_id'].tolist()
+                message = (
+                    f"🚨 *Вторжение в зону {alert.metadata['zone']}*\n"
+                    f"👥 Игроки ({alert.metadata['count']}):\n"
+                    f"{', '.join(alert.metadata['players'])}\n"
+                    f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
+                )
             else:
-                # Только админы из конфига
-                recipients = self.config['security']['admins']
+                message = (
+                    f"🚨 *{alert.source.upper()}* 🚨\n"
+                    f"_Игрок {alert.metadata.get('player', 'Unknown')}_\n"
+                    f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
+                )
 
-            # Формируем сообщение
-            message = (
-                f"🚨 *{alert.source.upper()}* 🚨\n"
-                f"_Игрок {alert.metadata.get('player', 'Unknown')}_\n"
-                f"🕒 {alert.timestamp.strftime('%Y-%m-%d %H:%M')}"
-            )
+            # Отправка только одному админу для критических событий
+            if alert.level == AlertLevel.CRITICAL:
+                await self.bot.send_message(
+                    chat_id=self.admin_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+            else:
+                # Отправка всем подписчикам
+                users = pd.read_csv(self.users_file)
+                approved_users = users[users['approved'] & users['subscribed']]
+                for user_id in approved_users['user_id']:
+                    await self.bot.send_message(
+                        chat_id=str(user_id),
+                        text=message,
+                        parse_mode='Markdown'
+                    )
+                    await asyncio.sleep(0.3)
 
-            # Отправка
-            for user_id in recipients:
+        except Exception as e:
+            logging.error(f"Ошибка отправки алерта: {str(e)}")
+
+    def init_temp_db(self):
+        """Инициализация базы для временных данных"""
+        self.temp_conn = sqlite3.connect('data.db', check_same_thread=False)
+        self.create_temp_tables()
+
+    def create_temp_tables(self):
+        """Создание таблиц для временных данных"""
+        try:
+            cursor = self.temp_conn.cursor()
+            # Таблица истории перемещений
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS player_movements (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    player TEXT NOT NULL,
+                    x REAL NOT NULL,
+                    z REAL NOT NULL,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            # Таблица активных трекеров
+            cursor.execute('''
+                CREATE TABLE IF NOT EXISTS tracking (
+                    player TEXT PRIMARY KEY,
+                    last_x REAL,
+                    last_z REAL,
+                    last_update DATETIME
+                )
+            ''')
+            self.temp_conn.commit()
+        except sqlite3.Error as e:
+            logging.error(f"Temp DB error: {str(e)}")
+
+    def process_player_movements(self, players):
+        """Обновляем историю, проверяем перемещения и отправляем уведомления"""
+        tracked_messages = []
+
+        try:
+            cursor = self.temp_conn.cursor()
+            current_time = datetime.now().isoformat()
+
+            for player in players:
+                name = player['name']
+                x = player['position']['x']
+                z = player['position']['z']
+
+                # 1. Сохранение в историю перемещений
+                cursor.execute('''
+                    INSERT INTO player_movements (player, x, z)
+                    VALUES (?, ?, ?)
+                ''', (name, x, z))
+
+                # 2. Проверка изменения позиции для трекинга
+                last_pos = self.telegram_bot.player_history.get(name.lower(), {"x": None, "z": None})
+                if (x != last_pos["x"]) or (z != last_pos["z"]):
+                    # Обновляем последние координаты
+                    self.telegram_bot.player_history[name.lower()] = {"x": x, "z": z}
+
+                    # 3. Формируем сообщение для подписчиков
+                    with self.telegram_bot.track_lock:
+                        subscribers = self.telegram_bot.tracked_players.get(name.lower(), set())
+                        if subscribers:
+                            msg = (
+                                f"📡 *{name}* переместился\n"
+                                f"📍 X: `{int(x)}` Z: `{int(z)}`\n"
+                                f"🕒 {datetime.now().strftime('%H:%M:%S')}"
+                            )
+                            tracked_messages.append((msg, subscribers))
+
+                # 4. Обновление таблицы tracking
+                cursor.execute('''
+                    INSERT OR REPLACE INTO tracking 
+                    (player, last_x, last_z, last_update)
+                    VALUES (?, ?, ?, ?)
+                ''', (name, x, z, current_time))
+
+            self.temp_conn.commit()
+
+            # 5. Отправка уведомлений подписчикам
+            if tracked_messages:
+                self.send_track_notifications(tracked_messages)
+
+        except Exception as e:
+            logging.error(f"Ошибка обработки перемещений: {str(e)}")
+            self.temp_conn.rollback()
+            raise
+
+    async def _async_send_track_notification(self, message, user_ids):
+        try:
+            for user_id in user_ids:
                 await self.telegram_bot.bot.send_message(
                     chat_id=user_id,
                     text=message,
                     parse_mode='Markdown'
                 )
-                await asyncio.sleep(0.5)
-
+                await asyncio.sleep(0.3)
         except Exception as e:
-            logging.error(f"Ошибка отправки алерта: {str(e)}")
+            logging.error(f"Ошибка отправки трек-уведомления: {str(e)}")
+
+    def send_track_notifications(self, messages):
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            threading.Thread(target=loop.run_forever, daemon=True).start()
+
+        for msg, user_ids in messages:
+            asyncio.run_coroutine_threadsafe(
+                self._async_send_track_notification(msg, user_ids),
+                loop
+            )
+
+    def get_player_history(self, player_name, limit=100):
+        """Получить историю перемещений игрока"""
+        try:
+            cursor = self.temp_conn.cursor()
+            cursor.execute('''
+                SELECT x, z, timestamp 
+                FROM player_movements 
+                WHERE player = ? 
+                ORDER BY timestamp DESC 
+                LIMIT ?
+            ''', (player_name, limit))
+            return cursor.fetchall()
+        except Exception as e:
+            logging.error(f"Get history error: {str(e)}")
+            return []
+
+    def get_last_position(self, player_name):
+        """Получить последние координаты игрока"""
+        try:
+            cursor = self.temp_conn.cursor()
+            cursor.execute('''
+                SELECT last_x, last_z, last_update 
+                FROM tracking 
+                WHERE player = ?
+            ''', (player_name,))
+            return cursor.fetchone()
+        except Exception as e:
+            logging.error(f"Get position error: {str(e)}")
+            return None
+
+    async def _async_send_track_notification(self, message, user_ids):
+        try:
+            for user_id in user_ids:
+                await self.telegram_bot.bot.send_message(
+                    chat_id=user_id,
+                    text=message,
+                    parse_mode='Markdown'
+                )
+                await asyncio.sleep(0.3)
+        except Exception as e:
+            logging.error(f"Ошибка отправки трек-уведомления: {str(e)}")
+
+    def send_track_notifications(self, messages):
+        loop = self.telegram_bot.app._loop  # <-- Исправлено
+        for msg, user_ids in messages:
+            asyncio.run_coroutine_threadsafe(
+                self._async_send_track_notification(msg, user_ids),
+                loop
+            )
 
     @staticmethod
     def load_config():
@@ -828,25 +1067,10 @@ class NoSos:
 
     def setup_plot(self):
         plt.style.use('dark_background')
-        self.fig = plt.figure(
-            figsize=(16, 10),
-            num=self.window_title
-        )
+        self.fig = plt.figure(figsize=(16, 10))
         self.ax = self.fig.add_subplot(111)
         self.fig.subplots_adjust(right=0.7, left=0.05)
         self.setup_controls()
-
-        try:
-            if plt.get_backend().lower() == 'tkagg':
-                manager = plt.get_current_fig_manager()
-                manager.window.wm_iconbitmap(self.icon_path)
-            elif plt.get_backend().lower() == 'qt5agg':
-                manager = plt.get_current_fig_manager()
-                manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
-        except Exception as e:
-            logging.error(f"Ошибка установки иконки: {str(e)}")
-
-        self.ax = self.fig.add_subplot(111)
 
     def setup_controls(self):
         self.player_list_ax = self.fig.add_axes([0.72, 0.25, 0.25, 0.70])
@@ -864,7 +1088,6 @@ class NoSos:
         self.current_data = []
         self.historical_data = deque(maxlen=self.config["heatmap"]["max_history"])
         self.data_lock = threading.Lock()
-        self.stop_event = threading.Event()
 
         # Новая статистика
         self.activity_by_hour = defaultdict(int)
@@ -900,7 +1123,7 @@ class NoSos:
         def db_task():
             try:
                 cursor = self.conn.cursor()
-                now = datetime.now().date().isoformat()  # Преобразуем дату в строку ISO 8601
+                now = datetime.now().isoformat()  # Преобразуем дату в строку ISO 8601
                 current_hour = datetime.now().hour
 
                 # Сохранение активности игроков
@@ -1055,7 +1278,7 @@ class NoSos:
 
             # Передача данных в AlertManager для проверки алертов
             self.alert_manager.process_data({"players": filtered_players})  # <-- Добавлено
-
+            self.process_player_movements(filtered_players)
             self.fetch_data.cache_clear()
 
         except Exception as e:
@@ -1209,56 +1432,23 @@ class NoSos:
             filtered = self.current_data
 
         if filtered:
-            head_cache = {}
+            x = [p["position"]["x"] for p in filtered]
+            z = [p["position"]["z"] for p in filtered]
+
+            self.ax.scatter(
+                x, z,
+                s=self.config["display"]["point_size"],
+                c=self.config["display"]["point_color"],
+                alpha=self.config["display"]["point_alpha"],
+                edgecolors='none',
+                zorder=10
+            )
+
             label_config = self.config["display"]["labels"]
-
-            # Загрузка всех изображений заранее
             for player in filtered:
-                username = player['name']
-                if username not in head_cache:
-                    try:
-                        response = requests.get(
-                            f"https://serverchichi.online/api/getHead/{username}.png",
-                            timeout=3
-                        )
-                        img = Image.open(BytesIO(response.content))
-                        head_cache[username] = img
-                    except Exception as e:
-                        head_cache[username] = None
-
-            # Отрисовка элементов в правильном порядке
-            for player in filtered:
-                x = player['position']['x']
-                z = player['position']['z']
-                username = player['name']
-                img = head_cache.get(username)
-
-                # 1. Отрисовка голов/точек (нижний слой)
-                if img:
-                    img_array = np.array(img)
-                    imagebox = OffsetImage(img_array, zoom=0.15)
-                    ab = AnnotationBbox(
-                        imagebox,
-                        (x, z),
-                        frameon=False,
-                        pad=0,
-                        zorder=10  # Головы под метками, но над фоном
-                    )
-                    self.ax.add_artist(ab)
-                else:
-                    self.ax.scatter(
-                        x, z,
-                        s=self.config["display"]["point_size"],
-                        c=self.config["display"]["point_color"],
-                        alpha=self.config["display"]["point_alpha"],
-                        edgecolors='none',
-                        zorder=10
-                    )
-
-                # 2. Отрисовка меток (верхний слой)
                 text = self.ax.annotate(
-                    username,
-                    xy=(x, z),
+                    player['name'],
+                    xy=(player['position']['x'], player['position']['z']),
                     xytext=(0, label_config["y_offset"]),
                     textcoords='offset points',
                     color=label_config["text_color"],
@@ -1271,7 +1461,7 @@ class NoSos:
                         edgecolor='none',
                         alpha=label_config["bg_alpha"]
                     ),
-                    zorder=20  # Метки поверх всех элементов
+                    zorder=11
                 )
                 self.label_objects.append(text)
 
@@ -1300,7 +1490,6 @@ class NoSos:
             )
 
     def setup_labels(self):
-        self.ax.set_zorder(10)
         self.ax.set_xlim(self.world_bounds[0], self.world_bounds[1])
         self.ax.set_ylim(self.world_bounds[2], self.world_bounds[3])
         self.ax.set_title(f"Карта активности игроков ({datetime.now().strftime('%H:%M:%S')})",
@@ -1325,7 +1514,6 @@ class NoSos:
                 interval=2000,
                 cache_frame_data=False
             )
-            self.fig.canvas.manager.set_window_title(self.window_title)
             plt.show()
         finally:
             self.shutdown()
