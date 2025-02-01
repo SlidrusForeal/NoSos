@@ -1,5 +1,3 @@
-user_id,username,approved
-833655522,,True
-392049158,FlapacoJlbka,True
-463414826,,True
-7611365194,,True
+user_id,username,approved,subscribed
+833655522,,True,True
+7611365194,,True,True

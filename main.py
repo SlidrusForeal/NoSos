@@ -3,7 +3,6 @@ import json
 import logging
 import os
 import pickle
-import asyncpg
 import queue
 import sqlite3
 import time
@@ -20,8 +19,8 @@ from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
 
 import matplotlib
-
-matplotlib.use('Agg')
+matplotlib.use('Qt5Agg')
+from PyQt5 import QtGui
 
 import matplotlib.pyplot as plt
 import pandas as pd
@@ -55,9 +54,6 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
-logger = logging.getLogger(__name__)
-
-DATABASE_URL = "postgresql://postgres:IgCDeaSMmvIUsvwUrcUAwygSBvPmSylG@postgres.railway.internal:5432/railway"
 
 
 class AlertLevel(Enum):
@@ -66,52 +62,14 @@ class AlertLevel(Enum):
     CRITICAL = auto()
 
 
-async def init_db():
-    return await asyncpg.connect(DATABASE_URL)
-
-
-async def create_tables():
-    conn = await init_db()
-    try:
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS users (
-                user_id BIGINT PRIMARY KEY,
-                username TEXT,
-                approved BOOLEAN DEFAULT FALSE,
-                subscribed BOOLEAN DEFAULT FALSE
-            )
-        ''')
-
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS activity (
-                id SERIAL PRIMARY KEY,
-                player TEXT,
-                time FLOAT,
-                hour INTEGER,
-                date DATE
-            )
-        ''')
-
-        await conn.execute('''
-            CREATE TABLE IF NOT EXISTS zones (
-                id SERIAL PRIMARY KEY,
-                player TEXT,
-                zone TEXT,
-                time FLOAT,
-                date DATE
-            )
-        ''')
-    finally:
-        await conn.close()
-
-@dataclass
+@dataclass(frozen=True)
 class Alert:
     message: str
-    level: str
+    level: AlertLevel
     source: str
     timestamp: datetime
     metadata: Dict[str, Any] = None
-    cooldown: float = 60
+    cooldown: float = 60  # Добавлено поле cooldown
 
 
 class BaseAlertRule(ABC):
@@ -411,16 +369,24 @@ class AnalyticsEngine:
 
 
 class TelegramBot:
-    def __init__(self, config, monitor):
+    def __init__(self, config, monitor, users_file='users.csv'):
+        self.users_lock = threading.Lock()
         self.monitor = monitor
         self.config = config
+        self.users_file = users_file
         self.admin_id = str(config['telegram']['chat_id'])
         self.bot = Bot(token=config['telegram']['token'])
         self.app = ApplicationBuilder().token(config['telegram']['token']).build()
+        self._init_users_file()
         self._register_handlers()
 
         # Инициализируем модуль аналитики
         self.analytics = AnalyticsEngine(monitor)
+
+    def _init_users_file(self):
+        if not os.path.exists(self.users_file):
+            with open(self.users_file, 'w', encoding='utf-8') as f:
+                f.write("user_id,username,approved,subscribed\n")
 
     def _register_handlers(self):
         handlers = [
@@ -446,32 +412,41 @@ class TelegramBot:
     async def _check_admin(self, update: Update) -> bool:
         user_id = str(update.effective_user.id)
         if not self.monitor.security.is_admin(user_id):
-            await update.message.reply_text(
-                "⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
+            await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
             return False
         return True
 
     async def start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user = update.effective_user
-        user_id = user.id
         try:
+            user = update.effective_user
+            user_id = user.id
             username = user.username or ""
             avatar = None
+            # Получаем аватарку (если есть)
             user_profile_photos = await context.bot.get_user_profile_photos(user_id, limit=1)
             if user_profile_photos.total_count > 0:
                 avatar = user_profile_photos.photos[0][-1]
-                conn = await init_db()
-                try:
-                    exists = await conn.fetchval(
-                        'SELECT 1 FROM users WHERE user_id = $1', user.id
-                    )
-                    if not exists:
-                        await conn.execute('''
-                            INSERT INTO users (user_id, username, approved, subscribed)
-                            VALUES ($1, $2, $3, $4)
-                        ''', user.id, user.username, False, False)
-                finally:
-                    await conn.close()
+
+            # Потокобезопасное обновление файла пользователей
+            with self.users_lock:
+                with open(self.users_file, 'r+', encoding='utf-8') as f:
+                    users = pd.read_csv(f)
+                    if str(user_id) in users['user_id'].astype(str).values:
+                        await update.message.reply_text(
+                            "🛠 *Вы уже зарегистрированы в системе*",
+                            parse_mode='Markdown'
+                        )
+                        return
+                    normalized_name = self._normalize_name(username) if username else ""
+                    new_user = pd.DataFrame([[
+                        user_id,
+                        normalized_name,
+                        False,  # approved
+                        True  # subscribed
+                    ]], columns=users.columns)
+                    users = pd.concat([users, new_user], ignore_index=True)
+                    f.seek(0)
+                    users.to_csv(f, index=False)
 
             await update.message.reply_text(
                 "✅ *Ваш запрос отправлен администратору*",
@@ -631,26 +606,34 @@ class TelegramBot:
             await query.message.reply_text("Произошла ошибка при обработке запроса.")
 
     async def unsubscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        conn = await init_db()
-        try:
-            await conn.execute('''
-                UPDATE users SET subscribed = FALSE WHERE user_id = $1
-            ''', user_id)
-            await update.message.reply_text("🔕 Вы отписались от уведомлений!")
-        finally:
-            await conn.close()
+        user_id = str(update.effective_user.id)
+        with self.users_lock:
+            users = pd.read_csv(self.users_file)
+            user = users[users['user_id'] == int(user_id)]
+            if user.empty:
+                await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
+                return
+            if not user['subscribed'].values[0]:
+                await update.message.reply_text("ℹ Вы уже отписаны от уведомлений.")
+                return
+            users.loc[users['user_id'] == int(user_id), 'subscribed'] = False
+            users.to_csv(self.users_file, index=False)
+        await update.message.reply_text("🔕 Вы отписались от уведомлений!")
 
     async def subscribe(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        user_id = update.effective_user.id
-        conn = await init_db()
-        try:
-            await conn.execute('''
-                UPDATE users SET subscribed = TRUE WHERE user_id = $1
-            ''', user_id)
-            await update.message.reply_text("🔔 Вы подписались на уведомления!")
-        finally:
-            await conn.close()
+        user_id = str(update.effective_user.id)
+        with self.users_lock:
+            users = pd.read_csv(self.users_file)
+            user = users[users['user_id'] == int(user_id)]
+            if user.empty:
+                await update.message.reply_text("❌ Вы не зарегистрированы. Используйте /start.")
+                return
+            if user['subscribed'].values[0]:
+                await update.message.reply_text("ℹ Вы уже подписаны на уведомления.")
+                return
+            users.loc[users['user_id'] == int(user_id), 'subscribed'] = True
+            users.to_csv(self.users_file, index=False)
+        await update.message.reply_text("🔔 Вы подписались на уведомления!")
 
     async def history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
@@ -734,8 +717,10 @@ class TelegramBot:
         result = self.analytics.generate_player_report(player_name)
         await update.message.reply_text(result, parse_mode='Markdown')
 
-    async def run(self):
-        await self.app.run_polling()
+    def run(self):
+        """Запуск бота с явным созданием цикла событий"""
+        asyncio.set_event_loop(asyncio.new_event_loop())
+        self.app.run_polling()
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -747,6 +732,8 @@ class TelegramBot:
 
 class NoSos:
     def __init__(self):
+        self.window_title = "NoSos"
+        self.icon_path = "icon.ico"
         self.config = self.load_config()
         self.security = SecurityManager(self.config)
         self.telegram_bot = TelegramBot(self.config, self)
@@ -775,10 +762,20 @@ class NoSos:
         self.start_data_thread()
         self.start_db_handler()
         self.load_translations()
-        asyncio.run(create_tables())
+        threading.Thread(target=self.telegram_bot.run, daemon=True).start()
 
     def send_notifications(self, alert: Alert):
-        asyncio.run(self._async_send_alert(alert))
+        try:
+            loop = None
+            try:
+                loop = asyncio.get_running_loop()  # Получаем текущий event loop
+            except RuntimeError:
+                loop = asyncio.new_event_loop()  # Создаем новый event loop, если его нет
+                threading.Thread(target=self._run_loop, args=(loop,), daemon=True).start()
+
+            asyncio.run_coroutine_threadsafe(self._async_send_alert(alert), loop)
+        except Exception as e:
+            logging.error(f"Ошибка отправки уведомления: {str(e)}")
 
     def _run_loop(self, loop):
         """Функция для запуска event loop в отдельном потоке"""
@@ -816,34 +813,38 @@ class NoSos:
         except Exception as e:
             logging.error(f"Ошибка отправки алерта: {str(e)}")
 
-
     @staticmethod
     def load_config():
         with open('config.yaml', 'r', encoding='utf-8') as f:
-            return yaml.safe_load(f)
+            config = yaml.safe_load(f)
 
-    async def save_activity(self, player_data: dict):
-        conn = await init_db()
-        try:
-            await conn.execute('''
-                INSERT INTO activity (player, time, hour, date)
-                VALUES ($1, $2, $3, $4)
-            ''',
-            player_data['name'],
-            player_data['time'],
-            datetime.now().hour,
-            datetime.now().date())
-        finally:
-            await conn.close()
+        for zone in config['alerts']['zones']:
+            zone['alert_level'] = AlertLevel[zone.get('alert_level', 'INFO')]
+
+        if 'limits' in config['alerts']:
+            config['alerts']['limits']['alert_level'] = AlertLevel[config['alerts']['limits']['alert_level']]
+
+        return config
 
     def setup_plot(self):
         plt.style.use('dark_background')
         self.fig = plt.figure(
-            figsize=(16, 10)
+            figsize=(16, 10),
+            num=self.window_title
         )
         self.ax = self.fig.add_subplot(111)
         self.fig.subplots_adjust(right=0.7, left=0.05)
         self.setup_controls()
+
+        try:
+            if plt.get_backend().lower() == 'tkagg':
+                manager = plt.get_current_fig_manager()
+                manager.window.wm_iconbitmap(self.icon_path)
+            elif plt.get_backend().lower() == 'qt5agg':
+                manager = plt.get_current_fig_manager()
+                manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
+        except Exception as e:
+            logging.error(f"Ошибка установки иконки: {str(e)}")
 
         self.ax = self.fig.add_subplot(111)
 
@@ -1320,14 +1321,14 @@ class NoSos:
     def run(self):
         try:
             ani = FuncAnimation(
-                self.fig, 
-                self.update_plot,
+                self.fig, self.update_plot,
                 interval=2000,
                 cache_frame_data=False
             )
-            plt.show(block=True)  # Блокирующий вызов в отдельном потоке
-        except Exception as e:
-            logger.error(f"GUI error: {str(e)}")
+            self.fig.canvas.manager.set_window_title(self.window_title)
+            plt.show()
+        finally:
+            self.shutdown()
 
     def translate(self, key):
         return self.translations[self.language].get(key, key)
@@ -1474,29 +1475,5 @@ class NoSos:
 
 
 if __name__ == "__main__":
-    # Явное создание нового event loop
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    
-    try:
-        monitor = NoSos()
-        
-        # Запускаем Telegram бот как асинхронную задачу
-        bot_task = loop.create_task(monitor.telegram_bot.run())
-        
-        # Запускаем GUI в отдельном потоке
-        with ThreadPoolExecutor() as executor:
-            gui_future = executor.submit(monitor.run)
-            
-            # Ожидаем завершения обеих задач
-            loop.run_until_complete(bot_task)
-            gui_future.result()
-            
-    except KeyboardInterrupt:
-        logger.info("Завершение работы...")
-    finally:
-        # Корректное закрытие ресурсов
-        loop.close()
-        if 'monitor' in locals():
-            monitor.shutdown()
-        logger.info("Приложение остановлено")
+    monitor = NoSos()
+    monitor.run()

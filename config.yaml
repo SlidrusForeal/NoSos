@@ -7,6 +7,11 @@ world_bounds:
 update_interval: 15
 min_request_interval: 5
 display:
+  head_zorder: 15
+  label_zorder: 20
+  head_size: 0.15
+  head_timeout: 3
+  fallback_dot: true
   point_size: 25
   point_color: "#00FF00"
   point_alpha: 0.7
@@ -26,7 +31,7 @@ database:
 telegram:
   token: "7998680701:AAFLhnk1YmoKR3HDwct8VBQiPvhz9FOGk7U"
   chat_id: "833655522"
-  admin_commands: ["/approve", "/users", "/send"]
+  admin_commands: ["/approve", "/users"]
 alerts:
   zones:
     - name: "Спавн"
@@ -51,6 +56,7 @@ alerts:
         zmin: -3465
         zmax: -2225
       allowed_players:
+        - "K1zik"
         - "KomJys"
         - "MrSemper"
         - "Kwakich"
