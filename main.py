@@ -1324,7 +1324,9 @@ class NoSos:
                 interval=2000,
                 cache_frame_data=False
             )
-            ani.save('animation.gif', writer='pillow')  # Сохранить анимацию в файл
+            plt.show(block=True)  # Блокирующий вызов для GUI
+        except Exception as e:
+            logger.error(f"GUI error: {str(e)}")
         finally:
             self.shutdown()
 
@@ -1473,7 +1475,16 @@ class NoSos:
 
 
 if __name__ == "__main__":
-    monitor = NoSos()
-    loop = asyncio.get_event_loop()
-    loop.create_task(monitor.telegram_bot.run())
-    monitor.run()  # Запуск GUI/монитора
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+
+    try:
+        monitor = NoSos()
+        loop.run_until_complete(
+            asyncio.gather(
+                monitor.telegram_bot.run(),
+                loop.run_in_executor(None, monitor.run)
+            )
+        )
+    finally:
+        loop.close()
