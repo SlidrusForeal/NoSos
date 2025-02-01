@@ -748,7 +748,6 @@ class TelegramBot:
 class NoSos:
     def __init__(self):
         self.config = self.load_config()
-        self.loop = asyncio.get_event_loop()
         self.security = SecurityManager(self.config)
         self.telegram_bot = TelegramBot(self.config, self)
         self.world_bounds = (
@@ -1475,4 +1474,6 @@ class NoSos:
 
 if __name__ == "__main__":
     monitor = NoSos()
-    monitor.run()
+    loop = asyncio.get_event_loop()
+    loop.create_task(monitor.telegram_bot.run())
+    monitor.run()  # Запуск GUI/монитора
