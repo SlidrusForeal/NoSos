@@ -754,7 +754,7 @@ class TelegramBot:
         await update.message.reply_text(result, parse_mode='Markdown')
 
     async def run(self):
-        await self.bot.app.run_polling()
+        await self.app.run_polling()
 
     @staticmethod
     @lru_cache(maxsize=1000)
@@ -767,6 +767,8 @@ class TelegramBot:
 class NoSos:
     def __init__(self):
         self.config = self.load_config()
+        self.telegram_bot = TelegramBot(self.config)
+        self.loop = asyncio.get_event_loop()
         self.security = SecurityManager(self.config)
         self.telegram_bot = TelegramBot(self.config, self)
         self.world_bounds = (
@@ -794,7 +796,6 @@ class NoSos:
         self.start_data_thread()
         self.start_db_handler()
         self.load_translations()
-        self.telegram_bot.run()
         asyncio.run(create_tables())
 
     def send_notifications(self, alert: Alert):
@@ -1494,4 +1495,4 @@ class NoSos:
 
 if __name__ == "__main__":
     monitor = NoSos()
-    asyncio.run(monitor.run())
+    monitor.run()
