@@ -1324,9 +1324,6 @@ class NoSos:
                 interval=2000,
                 cache_frame_data=False
             )
-            plt.show(block=True)  # Блокирующий вызов для GUI
-        except Exception as e:
-            logger.error(f"GUI error: {str(e)}")
         finally:
             self.shutdown()
 
