@@ -1320,13 +1320,14 @@ class NoSos:
     def run(self):
         try:
             ani = FuncAnimation(
-                self.fig, self.update_plot,
+                self.fig, 
+                self.update_plot,
                 interval=2000,
                 cache_frame_data=False
             )
-            ani.save('animation.gif', writer='pillow')  # Сохранить анимацию в файл
-        finally:
-            self.shutdown()
+            plt.show(block=True)  # Блокирующий вызов в отдельном потоке
+        except Exception as e:
+            logger.error(f"GUI error: {str(e)}")
 
     def translate(self, key):
         return self.translations[self.language].get(key, key)
@@ -1473,16 +1474,29 @@ class NoSos:
 
 
 if __name__ == "__main__":
+    # Явное создание нового event loop
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
-
+    
     try:
         monitor = NoSos()
-        loop.run_until_complete(
-            asyncio.gather(
-                monitor.telegram_bot.run(),
-                loop.run_in_executor(None, monitor.run)
-            )
-        )
+        
+        # Запускаем Telegram бот как асинхронную задачу
+        bot_task = loop.create_task(monitor.telegram_bot.run())
+        
+        # Запускаем GUI в отдельном потоке
+        with ThreadPoolExecutor() as executor:
+            gui_future = executor.submit(monitor.run)
+            
+            # Ожидаем завершения обеих задач
+            loop.run_until_complete(bot_task)
+            gui_future.result()
+            
+    except KeyboardInterrupt:
+        logger.info("Завершение работы...")
     finally:
+        # Корректное закрытие ресурсов
         loop.close()
+        if 'monitor' in locals():
+            monitor.shutdown()
+        logger.info("Приложение остановлено")
