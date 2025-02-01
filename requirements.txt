@@ -1,0 +1,4 @@
+asyncpg
+requests
+python-telegram-bot
+pyyaml
