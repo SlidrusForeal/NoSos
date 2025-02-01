@@ -422,25 +422,6 @@ class TelegramBot:
         # Инициализируем модуль аналитики
         self.analytics = AnalyticsEngine(monitor)
 
-    def _init_users_file(self):
-        if not os.path.exists(self.users_file):
-            with open(self.users_file, 'w', encoding='utf-8') as f:
-                f.write("user_id,username,approved,subscribed\n")
-        else:
-            # Проверяем наличие колонки 'subscribed' и добавляем при необходимости
-            with open(self.users_file, 'r+', encoding='utf-8') as f:
-                lines = f.readlines()
-                if lines:
-                    headers = lines[0].strip().split(',')
-                    if 'subscribed' not in headers:
-                        # Добавляем колонку 'subscribed' с дефолтным значением False
-                        new_lines = [lines[0].strip() + ',subscribed\n']
-                        for line in lines[1:]:
-                            new_lines.append(line.strip() + ',False\n')
-                        f.seek(0)
-                        f.writelines(new_lines)
-                        f.truncate()
-
     def _register_handlers(self):
         handlers = [
             CommandHandler("start", self.start),
@@ -767,7 +748,6 @@ class TelegramBot:
 class NoSos:
     def __init__(self):
         self.config = self.load_config()
-        self.telegram_bot = TelegramBot(self.config)
         self.loop = asyncio.get_event_loop()
         self.security = SecurityManager(self.config)
         self.telegram_bot = TelegramBot(self.config, self)
