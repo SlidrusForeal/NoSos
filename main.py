@@ -25,6 +25,7 @@ import yaml
 from matplotlib.animation import FuncAnimation
 import threading
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.helpers import escape_markdown
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -36,6 +37,19 @@ from telegram.ext import (
 )
 from telegram.request import HTTPXRequest
 import asyncio
+import sys
+
+import matplotlib
+
+matplotlib.use('Qt5Agg')
+from PyQt5 import QtGui
+
+if getattr(sys, 'frozen', False):
+    BASE_DIR = sys._MEIPASS
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+CONFIG_PATH = os.path.join(BASE_DIR, 'config.yaml')
 
 request = HTTPXRequest()
 
@@ -318,6 +332,7 @@ class SecurityManager:
         with open(self.log_file, 'a', encoding='utf-8') as f:
             f.write(entry)
 
+
 class AnalyticsEngine:
     def __init__(self, monitor):
         self.monitor = monitor
@@ -356,7 +371,6 @@ class AnalyticsEngine:
         for zone, time in zone_time.items():
             report += f"• {zone}: {time // 60} мин.\n"
         return report
-
 
 
 class TelegramBot:
@@ -406,7 +420,8 @@ class TelegramBot:
     async def _check_admin(self, update: Update) -> bool:
         user_id = str(update.effective_user.id)
         if not self.monitor.security.is_admin(user_id):
-            await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
+            await update.message.reply_text(
+                "⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
             return False
         return True
 
@@ -432,8 +447,9 @@ class TelegramBot:
             self.tracked_players[player_name.lower()].add(user_id)
 
         await update.message.reply_text(
-            f"🔭 Вы подписались на перемещения игрока {player_name}\n"
-            f"Используйте /untrack {player_name} для отмены"
+            f"🔭 Вы подписались на перемещения игрока {escape_markdown(player_name, version=2)}\n"
+            f"Используйте /untrack {escape_markdown(player_name, version=2)} для отмены",
+            parse_mode='Markdown'
         )
 
     async def untrack_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -770,6 +786,8 @@ class TelegramBot:
 
 class NoSos:
     def __init__(self):
+        self.window_title = "NoSos"
+        self.icon_path = "icon.ico"
         self.stop_event = threading.Event()  # Инициализация stop_event здесь
         self.config = self.load_config()
         self.admin_id = str(self.config["telegram"]["chat_id"])
@@ -809,6 +827,7 @@ class NoSos:
 
     def start_cleanup_thread(self):
         """Поток для очистки устаревших данных"""
+
         def cleanup_worker():
             while not self.stop_event.is_set():
                 try:
@@ -840,6 +859,7 @@ class NoSos:
 
     def start_temp_db_handler(self):
         """Обработчик задач для временной БД"""
+
         def handler():
             while not self.stop_event.is_set():
                 try:
@@ -856,16 +876,20 @@ class NoSos:
     async def _async_send_alert(self, alert: Alert):
         try:
             if alert.source == "zone_intrusion":
+                zone_name = escape_markdown(alert.metadata['zone'], version=2)
+                players_list = [escape_markdown(p, version=2) for p in alert.metadata['players']]
                 message = (
-                    f"🚨 *Вторжение в зону {alert.metadata['zone']}*\n"
+                    f"🚨 *Вторжение в зону {zone_name}*\n"
                     f"👥 Игроки ({alert.metadata['count']}):\n"
-                    f"{', '.join(alert.metadata['players'])}\n"
+                    f"{', '.join(players_list)}\n"
                     f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
                 )
             else:
+                player_name = escape_markdown(alert.metadata.get('player', 'Unknown'), version=2)
+                source = escape_markdown(alert.source.upper(), version=2)
                 message = (
-                    f"🚨 *{alert.source.upper()}* 🚨\n"
-                    f"_Игрок {alert.metadata.get('player', 'Unknown')}_\n"
+                    f"🚨 *{source}* 🚨\n"
+                    f"_Игрок {player_name}_\n"
                     f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
                 )
 
@@ -953,7 +977,7 @@ class NoSos:
                         subscribers = self.telegram_bot.tracked_players.get(name.lower(), set())
                         if subscribers:
                             msg = (
-                                f"📡 *{name}* переместился\n"
+                                f"📡 *{escape_markdown(name, version=2)}* переместился\n"
                                 f"📍 X: `{int(x)}` Z: `{int(z)}`\n"
                                 f"🕒 {datetime.now().strftime('%H:%M:%S')}"
                             )
@@ -1032,29 +1056,9 @@ class NoSos:
             logging.error(f"Get position error: {str(e)}")
             return None
 
-    async def _async_send_track_notification(self, message, user_ids):
-        try:
-            for user_id in user_ids:
-                await self.telegram_bot.bot.send_message(
-                    chat_id=user_id,
-                    text=message,
-                    parse_mode='Markdown'
-                )
-                await asyncio.sleep(0.3)
-        except Exception as e:
-            logging.error(f"Ошибка отправки трек-уведомления: {str(e)}")
-
-    def send_track_notifications(self, messages):
-        loop = self.telegram_bot.app._loop  # <-- Исправлено
-        for msg, user_ids in messages:
-            asyncio.run_coroutine_threadsafe(
-                self._async_send_track_notification(msg, user_ids),
-                loop
-            )
-
     @staticmethod
     def load_config():
-        with open('config.yaml', 'r', encoding='utf-8') as f:
+        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
             config = yaml.safe_load(f)
 
         for zone in config['alerts']['zones']:
@@ -1067,10 +1071,21 @@ class NoSos:
 
     def setup_plot(self):
         plt.style.use('dark_background')
-        self.fig = plt.figure(figsize=(16, 10))
+        self.fig = plt.figure(
+            figsize=(16, 10),
+            num=self.window_title
+        )
         self.ax = self.fig.add_subplot(111)
         self.fig.subplots_adjust(right=0.7, left=0.05)
         self.setup_controls()
+
+        try:
+            if plt.get_backend().lower() == 'qt5agg':
+                manager = plt.get_current_fig_manager()
+                manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
+        except Exception as e:
+            logging.error(f"Ошибка установки иконки: {str(e)}")
+        self.ax = self.fig.add_subplot(111)
 
     def setup_controls(self):
         self.player_list_ax = self.fig.add_axes([0.72, 0.25, 0.25, 0.70])
@@ -1569,7 +1584,7 @@ class NoSos:
             elif format == 'excel':
                 self.export_to_excel()
             elif format == 'player_zone_time':
-                self.export_player_zone_time()  # Новый метод для экспорта времени игроков в зонах
+                self.export_player_zone_time()
         except Exception as e:
             logging.error(f"Export error: {str(e)}")
 
