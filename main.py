@@ -151,8 +151,12 @@ class MovementAnomalyRule(BaseAlertRule):
         return np.linalg.norm(np.array(pos1) - np.array(pos2))
 
     def _create_speed_alert(self, player: Dict, speed: float) -> Alert:
+        # Экранирование специальных символов
+        safe_player = escape_markdown(player['name'], version=2)
+        safe_speed = escape_markdown(f"{speed:.1f}", version=2)
+
         return Alert(
-            message=f"Игрок {player['name']} движется со скоростью {speed:.1f} блоков/сек",
+            message=f"Игрок {safe_player} движется со скоростью {safe_speed} блоков/сек",
             level=self.alert_level,
             source="movement_anomaly",
             timestamp=datetime.now(),
@@ -165,8 +169,11 @@ class MovementAnomalyRule(BaseAlertRule):
         )
 
     def _create_teleport_alert(self, player: Dict, distance: float) -> Alert:
+        safe_player = escape_markdown(player['name'], version=2)
+        safe_distance = escape_markdown(f"{distance:.1f}", version=2)
+
         return Alert(
-            message=f"Игрок {player['name']} переместился на {distance:.1f} блоков мгновенно",
+            message=f"Игрок {safe_player} переместился на {safe_distance} блоков мгновенно",
             level=AlertLevel.CRITICAL,
             source="teleport_detection",
             timestamp=datetime.now(),
@@ -230,7 +237,7 @@ class ZoneIntrusionRule(BaseAlertRule):
     def _create_alert(self, zone_name: str, players: List[str]) -> Alert:
         return Alert(
             message=f"Обнаружены игроки в зоне {zone_name}",
-            level=self.alert_level,
+            level=self.alert_level,  # Используем уровень из конфига зоны
             source="zone_intrusion",
             timestamp=datetime.now(),
             metadata={
@@ -411,19 +418,52 @@ class TelegramBot:
             CommandHandler("anomalies", self.anomalies),
             CommandHandler("heatmap", self.heatmap),
             CommandHandler("player_report", self.player_report),
+            CommandHandler("broadcast", self.broadcast_message),
             CallbackQueryHandler(self.handle_callback),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message),
         ]
         for handler in handlers:
             self.app.add_handler(handler)
 
-    async def _check_admin(self, update: Update) -> bool:
-        user_id = str(update.effective_user.id)
-        if not self.monitor.security.is_admin(user_id):
-            await update.message.reply_text(
-                "⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
-            return False
-        return True
+    async def _check_admin(self, update: Update, command_name: str = None) -> bool:
+        user = update.effective_user
+        user_id = str(user.id)
+
+        if self.monitor.security.is_admin(user_id):
+            return True
+
+        # Формируем информацию о попытке доступа
+        try:
+            full_name = escape_markdown(user.full_name, version=2)
+            username = f"@{escape_markdown(user.username, version=2)}" if user.username else "N/A"
+            command = escape_markdown(command_name, version=2) if command_name else "unknown"
+            timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            admin_alert = (
+                f"🚨 *Попытка несанкционированного доступа нужен ДОКС* 🚨\n"
+                f"• User ID: `{user_id}`\n"
+                f"• Имя: {full_name}\n"
+                f"• Username: {username}\n"
+                f"• Команда: `{command}`\n"
+                f"• Время: {timestamp}"
+            )
+
+            # Отправляем уведомление админу
+            await self.bot.send_message(
+                chat_id=self.admin_id,
+                text=admin_alert,
+                parse_mode='MarkdownV2'
+            )
+
+            # Логируем событие
+            logging.warning(f"Несанкционированный доступ к команде {command} от {user_id} ({user.full_name})")
+
+        except Exception as e:
+            logging.error(f"Ошибка отправки уведомления админу: {str(e)}")
+
+        # Отправляем сообщение пользователю
+        await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
+        return False
 
     async def track_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Подписаться на уведомления о перемещениях игрока"""
@@ -449,9 +489,8 @@ class TelegramBot:
         await update.message.reply_text(
             f"🔭 Вы подписались на перемещения игрока {escape_markdown(player_name, version=2)}\n"
             f"Используйте /untrack {escape_markdown(player_name, version=2)} для отмены",
-            parse_mode='Markdown'
+            parse_mode='MarkdownV2'
         )
-
     async def untrack_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отписаться от трекинга"""
         user_id = str(update.effective_user.id)
@@ -540,7 +579,7 @@ class TelegramBot:
             )
 
     async def approve_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_admin(update):
+        if not await self._check_admin(update, "approve"):
             await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
             return
 
@@ -580,7 +619,7 @@ class TelegramBot:
             await update.message.reply_text("Произошла ошибка при одобрении пользователя.")
 
     async def list_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_admin(update):
+        if not await self._check_admin(update, "list_users"):
             return
 
         users = pd.read_csv(self.users_file)
@@ -591,7 +630,7 @@ class TelegramBot:
         await update.message.reply_text(text, parse_mode='Markdown')
 
     async def send_message_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not await self._check_admin(update):
+        if not await self._check_admin(update, "send"):
             return
 
         if not context.args or len(context.args) < 2:
@@ -725,7 +764,7 @@ class TelegramBot:
         Команда: /anomalies <скорость> <дистанция>
         Проверяет аномалии по данным игрока.
         """
-        if not await self._check_admin(update):
+        if not await self._check_admin(update, "anomalies"):
             return
 
         if len(context.args) < 2:
@@ -748,7 +787,7 @@ class TelegramBot:
         Команда: /heatmap
         Генерирует отчёт по топ-5 активным зонам.
         """
-        if not await self._check_admin(update):
+        if not await self._check_admin(update, "heatmap"):
             return
 
         result = self.analytics.generate_heatmap_report()
@@ -759,7 +798,7 @@ class TelegramBot:
         Команда: /player_report <имя игрока>
         Отчёт по времени игрока и активности по зонам.
         """
-        if not await self._check_admin(update):
+        if not await self._check_admin(update, "player_report"):
             return
 
         if not context.args:
@@ -769,6 +808,41 @@ class TelegramBot:
         player_name = " ".join(context.args)
         result = self.analytics.generate_player_report(player_name)
         await update.message.reply_text(result, parse_mode='Markdown')
+
+    async def broadcast_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для рассылки сообщения всем пользователям."""
+        if not await self._check_admin(update, "broadcast"):
+            return
+
+        if not context.args:
+            await update.message.reply_text("❌ Использование: /broadcast <текст сообщения>")
+            return
+
+        message = " ".join(context.args).strip()
+        safe_message = escape_markdown(message, version=2)
+
+        users = pd.read_csv(self.users_file)
+        approved_users = users[users['approved'] & users['subscribed']]
+
+        sent_count = 0
+        failed_count = 0
+
+        for user_id in approved_users['user_id']:
+            try:
+                await self.bot.send_message(
+                    chat_id=str(user_id),
+                    text=safe_message,
+                    parse_mode='MarkdownV2'
+                )
+                sent_count += 1
+                await asyncio.sleep(0.3)
+            except Exception as e:
+                logging.error(f"Ошибка отправки пользователю {user_id}: {str(e)}")
+                failed_count += 1
+
+        await update.message.reply_text(
+            f"📢 Сообщение отправлено!\n✅ Успешно: {sent_count}\n❌ Ошибок: {failed_count}"
+        )
 
     def run(self):
         """Запуск бота с явным созданием цикла событий"""
@@ -788,6 +862,7 @@ class NoSos:
     def __init__(self):
         self.window_title = "NoSos"
         self.icon_path = "icon.ico"
+        self.users_file = "users.csv"
         self.stop_event = threading.Event()  # Инициализация stop_event здесь
         self.config = self.load_config()
         self.admin_id = str(self.config["telegram"]["chat_id"])
@@ -875,45 +950,62 @@ class NoSos:
 
     async def _async_send_alert(self, alert: Alert):
         try:
-            if alert.source == "zone_intrusion":
-                zone_name = escape_markdown(alert.metadata['zone'], version=2)
-                players_list = [escape_markdown(p, version=2) for p in alert.metadata['players']]
+            if not alert.message.strip():
+                logging.error("Пустое сообщение алерта")
+                return
+
+            # Формирование сообщения в зависимости от типа алерта
+            if alert.source == "movement_anomaly":
                 message = (
-                    f"🚨 *Вторжение в зону {zone_name}*\n"
-                    f"👥 Игроки ({alert.metadata['count']}):\n"
-                    f"{', '.join(players_list)}\n"
-                    f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
-                )
-            else:
-                player_name = escape_markdown(alert.metadata.get('player', 'Unknown'), version=2)
-                source = escape_markdown(alert.source.upper(), version=2)
-                message = (
-                    f"🚨 *{source}* 🚨\n"
-                    f"_Игрок {player_name}_\n"
+                    f"🚨 *Превышение скорости* 🚨\n"
+                    f"Игрок: _{alert.metadata['player']}_\n"
+                    f"Скорость: `{alert.metadata['speed']}` блоков/сек\n"
                     f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
                 )
 
-            # Отправка только одному админу для критических событий
+            elif alert.source == "zone_intrusion":
+                message = (
+                    f"🚨 *Вторжение в зону {alert.metadata['zone']}* 🚨\n"
+                    f"👥 Игроки ({alert.metadata['count']}): {', '.join(alert.metadata['players'])}\n"
+                    f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
+                )
+
+            else:
+                message = (
+                    f"🚨 *Телепортация / смертьь* 🚨\n"
+                    f"Источник: {alert.source.upper()}\n"
+                    f"Игрок: {alert.metadata.get('player', 'Неизвестно')}\n"
+                    f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
+                )
+
+            # Экранирование ВСЕГО сообщения перед отправкой
+            safe_message = escape_markdown(message, version=2)
+
+            # Отправка админу при критических алертах
             if alert.level == AlertLevel.CRITICAL:
                 await self.bot.send_message(
                     chat_id=self.admin_id,
-                    text=message,
-                    parse_mode='Markdown'
+                    text=safe_message,
+                    parse_mode='MarkdownV2'
                 )
             else:
-                # Отправка всем подписчикам
+                # Отправка подписчикам
                 users = pd.read_csv(self.users_file)
                 approved_users = users[users['approved'] & users['subscribed']]
+
                 for user_id in approved_users['user_id']:
-                    await self.bot.send_message(
-                        chat_id=str(user_id),
-                        text=message,
-                        parse_mode='Markdown'
-                    )
-                    await asyncio.sleep(0.3)
+                    try:
+                        await self.bot.send_message(
+                            chat_id=str(user_id),
+                            text=safe_message,
+                            parse_mode='MarkdownV2'
+                        )
+                        await asyncio.sleep(0.3)
+                    except Exception as e:
+                        logging.error(f"Ошибка отправки пользователю {user_id}: {str(e)}")
 
         except Exception as e:
-            logging.error(f"Ошибка отправки алерта: {str(e)}")
+            logging.error(f"Ошибка отправки алерта: {str(e)}", exc_info=True)
 
     def init_temp_db(self):
         """Инициализация базы для временных данных"""
