@@ -348,11 +348,15 @@ class AlertManager:
                         self.active_alerts[alert_id] = alert
             except Exception as e:
                 logging.error(f"Ошибка в правиле {rule.__class__.__name__}: {str(e)}")
+
         for alert in new_alerts:
             alert_id = self._generate_alert_id(alert.source, alert.message)
             self.active_alerts[alert_id] = alert
             self.alert_history.append(alert)
             monitor.send_notifications(alert)
+            # Удаляем алерт из активных сразу после отправки
+            del self.active_alerts[alert_id]
+
         self._clean_expired_alerts()
 
     def _clean_expired_alerts(self):
@@ -1027,6 +1031,8 @@ class NoSos:
         self.load_translations()
         threading.Thread(target=self.telegram_bot.run, daemon=True).start()
         self.start_cleanup_thread()
+        self.sent_alerts_cache = set()
+        self.alert_cache_lock = threading.Lock()
 
     def start_cleanup_thread(self):
         """Поток для очистки устаревших данных"""
@@ -1082,6 +1088,17 @@ class NoSos:
                 logging.error("Пустое сообщение алерта")
                 return
 
+            # Создаем уникальный ключ для алерта
+            alert_key = hash(alert.message)
+
+            with self.alert_cache_lock:
+                if alert_key in self.sent_alerts_cache:
+                    logging.info(f"Алерт уже был отправлен: {alert.message}")
+                    return
+
+                # Добавляем алерт в кэш
+                self.sent_alerts_cache.add(alert_key)
+
             # Формирование сообщения в зависимости от типа алерта
             if alert.source == "movement_anomaly":
                 message = (
@@ -1120,7 +1137,6 @@ class NoSos:
                 # Отправка подписчикам
                 users = pd.read_csv(self.users_file)
                 approved_users = users[users['approved'] & users['subscribed']]
-
                 for user_id in approved_users['user_id']:
                     try:
                         await self.bot.send_message(
