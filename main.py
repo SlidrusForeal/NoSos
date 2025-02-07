@@ -1,15 +1,16 @@
+import asyncio
 import csv
 import json
 import logging
 import os
 import pickle
 import queue
-import sqlite3
-import time
-import unicodedata
-import re
-import numpy as np
 import random
+import re
+import sqlite3
+import sys
+import threading
+import time
 from abc import ABC, abstractmethod
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -18,14 +19,18 @@ from enum import Enum, auto
 from functools import lru_cache
 from typing import Dict, Any, List, Tuple, Optional
 
+import aiohttp
+import matplotlib
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import requests
+import unicodedata
 import yaml
+from PyQt5 import QtGui
+from bs4 import BeautifulSoup
 from matplotlib.animation import FuncAnimation
-import threading
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.helpers import escape_markdown
 from telegram.constants import ParseMode
 from telegram.ext import (
     ApplicationBuilder,
@@ -35,29 +40,21 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
-import asyncio
-import sys
-
-import matplotlib
-
-matplotlib.use('Qt5Agg')
-from PyQt5 import QtGui
 
 if getattr(sys, 'frozen', False):
     BASE_DIR = sys._MEIPASS
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.yaml')
-
 request = HTTPXRequest()
-
+matplotlib.use('Qt5Agg')
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('monitor.log'),
+        logging.FileHandler('monitor.log', encoding='utf-8'),
         logging.StreamHandler()
     ]
 )
@@ -77,6 +74,74 @@ class Alert:
     timestamp: datetime
     metadata: Dict[str, Any] = None
     cooldown: float = 60
+
+
+class PlayerParser:
+    BASE_URL = "https://serverchichi.online/player/"
+
+    @staticmethod
+    async def fetch_player_page(player_name: str) -> str:
+        url = f"{PlayerParser.BASE_URL}{player_name}"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url) as response:
+                if response.status != 200:
+                    logging.error(f"Ошибка запроса {url}: {response.status}")
+                    return ""
+                return await response.text()
+
+    @staticmethod
+    async def parse_player_profile(player_name: str) -> dict:
+        html_content = await PlayerParser.fetch_player_page(player_name)
+        if not html_content:
+            return {}
+        soup = BeautifulSoup(html_content, 'html.parser')
+        player_data = {}
+
+        # Парсим соцсети
+        socials_section = soup.find('div', class_='socials')
+        player_data['socials'] = []
+        if socials_section:
+            for a in socials_section.find_all('a'):
+                text = a.get_text(strip=True)
+                href = a.get('href', '')
+                if text and href:
+                    player_data['socials'].append((text, href))
+
+        # Парсим роли
+        roles_section = soup.find('div', class_='roles')
+        player_data['roles'] = [role.get_text(strip=True) for role in
+                                roles_section.find_all('span')] if roles_section else []
+
+        # Парсим статистику
+        stats_section = soup.find('div', class_='stats')
+        player_data['stats'] = [stat.get_text(strip=True) for stat in
+                                stats_section.find_all('p')] if stats_section else []
+
+        # Парсим RP-карточки
+        rp_container = soup.find('div', class_='rp-container')
+        if rp_container:
+            player_data['rp_cards'] = [
+                {'h3': card.find('h3').get_text(strip=True) if card.find('h3') else 'Без названия',
+                 'p': card.find('p').get_text(strip=True) if card.find('p') else 'Нет данных'}
+                for card in rp_container.find_all('div', class_='rp-card')
+            ]
+        else:
+            player_data['rp_cards'] = []
+
+        # Парсим премиум статус
+        premium_section = soup.find('div', class_='player-plus-content')
+        if premium_section:
+            premium_text = premium_section.get_text(strip=True)
+            # Извлекаем только часть с уровнем СЧ+
+            match = re.search(r'СЧ\+\s*(\d+)\s*Уровня', premium_text)
+            if match:
+                player_data['player_plus'] = f"СЧ+ {match.group(1)} Уровня"
+            else:
+                player_data['player_plus'] = "СЧ+ пока не куплен"
+        else:
+            player_data['player_plus'] = "СЧ+ пока не куплен"
+
+        return player_data
 
 
 class BaseAlertRule(ABC):
@@ -107,20 +172,16 @@ class MovementAnomalyRule(BaseAlertRule):
     def check_conditions(self, data: Dict) -> List[Alert]:
         alerts = []
         current_time = time.time()
-
         for player in data.get("players", []):
             try:
                 player_id = player["uuid"]
                 current_pos = (player["position"]["x"], player["position"]["z"])
                 last_pos, last_time = self._get_player_history(player_id)
-
                 if last_pos is None:
                     self._update_player_history(player_id, current_pos, current_time)
                     continue
-
                 distance = self._calculate_distance(last_pos, current_pos)
                 time_diff = current_time - last_time
-
                 if time_diff > 0:
                     speed = distance / time_diff
                     if speed > self.max_speed:
@@ -128,16 +189,12 @@ class MovementAnomalyRule(BaseAlertRule):
                             alert = self._create_teleport_alert(player, distance)
                         else:
                             alert = self._create_speed_alert(player, speed)
-
                         if self._should_trigger(alert.message):
                             alerts.append(alert)
                             self._update_cooldown(alert.message)
-
-                self._update_player_history(player_id, current_pos, current_time)
-
+                            self._update_player_history(player_id, current_pos, current_time)
             except Exception as e:
                 logging.error(f"Ошибка обработки игрока {player.get('name')}: {str(e)}")
-
         return alerts
 
     def _get_player_history(self, player_id: str) -> Tuple[Optional[Tuple[float, float]], float]:
@@ -154,7 +211,6 @@ class MovementAnomalyRule(BaseAlertRule):
         # Экранирование специальных символов
         safe_player = escape_markdown(player['name'], version=2)
         safe_speed = escape_markdown(f"{speed:.1f}", version=2)
-
         return Alert(
             message=f"Игрок {safe_player} движется со скоростью {safe_speed} блоков/сек",
             level=self.alert_level,
@@ -171,7 +227,6 @@ class MovementAnomalyRule(BaseAlertRule):
     def _create_teleport_alert(self, player: Dict, distance: float) -> Alert:
         safe_player = escape_markdown(player['name'], version=2)
         safe_distance = escape_markdown(f"{distance:.1f}", version=2)
-
         return Alert(
             message=f"Игрок {safe_player} переместился на {safe_distance} блоков мгновенно",
             level=AlertLevel.CRITICAL,
@@ -207,31 +262,24 @@ class ZoneIntrusionRule(BaseAlertRule):
     def check_conditions(self, data: Dict) -> List[Alert]:
         if self.excluded:
             return []
-
         alerts = []
         zone_name = self.config["name"]
         allowed = {self._normalize_name(p) for p in self.config.get("allowed_players", [])}
         intruders = []
-
         for player in data.get("players", []):
             pos = player.get("position", {})
             x, z = pos.get("x", 0), pos.get("z", 0)
-
             if not self._in_zone(x, z):
                 continue
-
             norm_name = self._normalize_name(player.get("name", ""))
             if norm_name in allowed:
                 continue
-
             intruders.append(player.get('name', 'Unknown'))
-
         if intruders:
             alert_id = f"{zone_name}_intrusion"
             if self._should_trigger(alert_id):
                 alerts.append(self._create_alert(zone_name, intruders))
                 self._update_cooldown(alert_id)
-
         return alerts
 
     def _create_alert(self, zone_name: str, players: List[str]) -> Alert:
@@ -281,13 +329,10 @@ class AlertManager:
             "player_limit": PlayerCountRule,
             "movement_anomaly": MovementAnomalyRule
         }
-
         for rule_config in config.get("zones", []):
             self.rules.append(rule_registry["zone_intrusion"](rule_config))
-
         if "limits" in config:
             self.rules.append(rule_registry["player_limit"](config["limits"]))
-
         if "movement_anomaly" in config:
             self.rules.append(rule_registry["movement_anomaly"](config["movement_anomaly"]))
 
@@ -303,13 +348,11 @@ class AlertManager:
                         self.active_alerts[alert_id] = alert
             except Exception as e:
                 logging.error(f"Ошибка в правиле {rule.__class__.__name__}: {str(e)}")
-
         for alert in new_alerts:
             alert_id = self._generate_alert_id(alert.source, alert.message)
             self.active_alerts[alert_id] = alert
             self.alert_history.append(alert)
             monitor.send_notifications(alert)
-
         self._clean_expired_alerts()
 
     def _clean_expired_alerts(self):
@@ -340,6 +383,19 @@ class SecurityManager:
             f.write(entry)
 
 
+def clean_html_tags(text: str) -> str:
+    """
+    Удаляет HTML-теги и лишние пробелы из текста.
+    """
+    if not text:
+        return ""
+    text = re.sub(r'<span class="material-symbols-rounded">.*?</span>', '', text)
+    text = re.sub(r'<[^>]+>', '', text)
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'\s+([.,!?;:])', r'\1', text)
+    return text.strip()
+
+
 class AnalyticsEngine:
     def __init__(self, monitor):
         self.monitor = monitor
@@ -367,17 +423,80 @@ class AnalyticsEngine:
         report_lines = [f"• {zone}: {time // 60} минут" for zone, time in sorted_zones]
         return "🔥 Топ-5 активных зон:\n" + "\n".join(report_lines)
 
-    def generate_player_report(self, player_name: str) -> str:
-        total_time = self.monitor.player_time.get(player_name, 0)
-        zone_time = self.monitor.zone_time.get(player_name, {})
-        report = (
-            f"📊 Отчёт по игроку *{player_name}*\n"
-            f"Общее время онлайн: {total_time // 3600} ч. {total_time % 3600 // 60} мин.\n"
-            "Время в зонах:\n"
-        )
-        for zone, time in zone_time.items():
-            report += f"• {zone}: {time // 60} мин.\n"
-        return report
+    async def generate_player_report(self, player_name: str) -> str:
+        logging.debug(f"Запрос данных для игрока: {player_name}")
+        try:
+            # Получаем данные
+            player_history = self.monitor.get_player_history(player_name, limit=5)
+            last_position = self.monitor.get_last_position(player_name)
+            player_data = await PlayerParser.parse_player_profile(player_name)
+        except Exception as e:
+            logging.error(f"Ошибка получения данных: {str(e)}")
+            return f"❌ Ошибка при получении данных игрока {escape_markdown(player_name, version=2)}"
+
+        # Формируем базовую информацию
+        report = [
+            f"📊 *Отчёт по игроку* `{escape_markdown(player_name, version=2)}`",
+            f"🕒 Последняя активность: {datetime.now().strftime('%d.%m.%Y %H:%M')}"
+        ]
+
+        # Координаты
+        if last_position:
+            x, z, _ = last_position
+            zone_name = self.monitor.get_zone_name_by_coordinates(x, z)
+            if zone_name:
+                report.append(f"📍 Последняя зона: {escape_markdown(zone_name, version=2)}")
+            else:
+                report.append(f"📍 Последние координаты: `X: {int(x)} Z: {int(z)}`")
+
+        # История перемещений
+        if player_history:
+            unique_zones = set()
+            for x, z, _ in player_history:
+                zone_name = self.monitor.get_zone_name_by_coordinates(x, z)
+                if zone_name:
+                    unique_zones.add(zone_name)
+                else:
+                    unique_zones.add(f"X: {int(x)}, Z: {int(z)}")
+            report.append("\n🔍 *История перемещений:*\n" + "\n".join(
+                f"• {zone}" for zone in unique_zones
+            ))
+
+        # Парсинг данных с сайта
+        if player_data:
+            sections = [
+                ("📱 Соцсети", player_data.get('socials')),
+                ("🏅 Роли", player_data.get('roles')),
+                ("📈 Статистика", player_data.get('stats')),
+                ("🃏 РП-карточки", [
+                    f"{card['h3']}: {clean_html_tags(card['p'])}"
+                    for card in player_data.get('rp_cards', [])
+                ]),
+                ("💎 Премиум статус", [clean_html_tags(player_data.get('player_plus'))])
+            ]
+            for title, data in sections:
+                if data and any(data):
+                    cleaned_data = []
+                    for item in data:
+                        if isinstance(item, tuple) and len(item) == 2:
+                            # Формируем строку с ссылкой без экранирования
+                            name, link = item
+                            cleaned_data.append(f"{escape_markdown(name, version=2)}: {link}")
+                        else:
+                            # Заменяем sports_esports и emoji_events на соответствующие эмодзи
+                            item = item.replace("sports_esports", "🎮")
+                            item = item.replace("emoji_events", "🏆")
+                            # Удаляем лишние пробелы
+                            item = re.sub(r'\s+', ' ', item)
+                            item = re.sub(r'\s+([.,!?;:])', r'\1', item)
+                            cleaned_data.append(item)
+                    report.append(f"\n{title}:\n" + "\n".join(f"• {item}" for item in cleaned_data if item))
+
+        # Если данных нет вообще
+        if len(report) == 2:
+            report.append("\nℹ️ Дополнительные данные не найдены")
+
+        return "\n".join(report)
 
 
 class TelegramBot:
@@ -394,7 +513,6 @@ class TelegramBot:
         self.player_history = defaultdict(lambda: {"x": 0, "z": 0})  # Последние координаты
         self._init_users_file()
         self._register_handlers()
-
         self.analytics = AnalyticsEngine(monitor)
 
     def _init_users_file(self):
@@ -428,53 +546,50 @@ class TelegramBot:
     async def _check_admin(self, update: Update, command_name: str = None) -> bool:
         user = update.effective_user
         user_id = str(user.id)
-
         if self.monitor.security.is_admin(user_id):
             return True
-
         # Формируем информацию о попытке доступа
         try:
             full_name = escape_markdown(user.full_name, version=2)
             username = f"@{escape_markdown(user.username, version=2)}" if user.username else "N/A"
             command = escape_markdown(command_name, version=2) if command_name else "unknown"
             timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
             admin_alert = (
-                f"🚨 *Попытка несанкционированного доступа нужен ДОКС* 🚨\n"
+                f"🚨 *Попытка несанкционированного доступа* 🚨\n"
                 f"• User ID: `{user_id}`\n"
                 f"• Имя: {full_name}\n"
                 f"• Username: {username}\n"
                 f"• Команда: `{command}`\n"
                 f"• Время: {timestamp}"
             )
-
+            # Экранируем зарезервированные символы в сообщении
+            admin_alert = escape_markdown(admin_alert, version=2)
             # Отправляем уведомление админу
+            logging.info(f"Отправка уведомления админу: {admin_alert}")  # Добавлено логирование
             await self.bot.send_message(
                 chat_id=self.admin_id,
                 text=admin_alert,
                 parse_mode='MarkdownV2'
             )
-
             # Логируем событие
             logging.warning(f"Несанкционированный доступ к команде {command} от {user_id} ({user.full_name})")
-
+            # Отправляем сообщение пользователю
+            await update.message.reply_text(
+                "⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
+            return False
         except Exception as e:
             logging.error(f"Ошибка отправки уведомления админу: {str(e)}")
-
-        # Отправляем сообщение пользователю
-        await update.message.reply_text("⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
-        return False
+            # Отправляем сообщение пользователю
+            await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
+            return False
 
     async def track_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Подписаться на уведомления о перемещениях игрока"""
         user_id = str(update.effective_user.id)
-
         if not context.args:
             await update.message.reply_text("❌ Укажите ник игрока: /track <ник>")
             return
-
         player_name = " ".join(context.args).strip()
-
         # Проверка прав доступа
         with self.users_lock:
             users = pd.read_csv(self.users_file)
@@ -482,25 +597,21 @@ class TelegramBot:
             if user.empty or not user['approved'].values[0]:
                 await update.message.reply_text("⛔️ Доступ запрещен!")
                 return
-
         with self.track_lock:
             self.tracked_players[player_name.lower()].add(user_id)
+            await update.message.reply_text(
+                f"🔭 Вы подписались на перемещения игрока {escape_markdown(player_name, version=2)}\n"
+                f"Используйте /untrack {escape_markdown(player_name, version=2)} для отмены",
+                parse_mode='MarkdownV2'
+            )
 
-        await update.message.reply_text(
-            f"🔭 Вы подписались на перемещения игрока {escape_markdown(player_name, version=2)}\n"
-            f"Используйте /untrack {escape_markdown(player_name, version=2)} для отмены",
-            parse_mode='MarkdownV2'
-        )
     async def untrack_player(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         """Отписаться от трекинга"""
         user_id = str(update.effective_user.id)
-
         if not context.args:
             await update.message.reply_text("❌ Укажите ник игрока: /untrack <ник>")
             return
-
         player_name = " ".join(context.args).strip().lower()
-
         with self.track_lock:
             if user_id in self.tracked_players.get(player_name, set()):
                 self.tracked_players[player_name].remove(user_id)
@@ -518,7 +629,6 @@ class TelegramBot:
             user_profile_photos = await context.bot.get_user_profile_photos(user_id, limit=1)
             if user_profile_photos.total_count > 0:
                 avatar = user_profile_photos.photos[0][-1]
-
             # Потокобезопасное обновление файла пользователей
             with self.users_lock:
                 with open(self.users_file, 'r+', encoding='utf-8') as f:
@@ -539,7 +649,6 @@ class TelegramBot:
                     users = pd.concat([users, new_user], ignore_index=True)
                     f.seek(0)
                     users.to_csv(f, index=False)
-
             await update.message.reply_text(
                 "✅ *Ваш запрос отправлен администратору*",
                 parse_mode='Markdown'
@@ -580,32 +689,25 @@ class TelegramBot:
 
     async def approve_user(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_admin(update, "approve"):
-            await update.message.reply_text("❌ У вас нет прав для выполнения этой команды.")
             return
-
         if not context.args or not context.args[0].isdigit():
-            await update.message.reply_text("❌ Используйте: /approve <ID пользователя>")
+            await update.message.reply_text("❌ Используйте: /approve <ID>")
             return
-
         user_id = context.args[0]
-
         try:
             with self.users_lock:
                 users = pd.read_csv(self.users_file)
                 matching_users = users.loc[users['user_id'] == int(user_id)]
-
                 if matching_users.empty:
                     await update.message.reply_text(f"❌ Пользователь с ID {user_id} не найден.")
                     return
-
                 users.loc[users['user_id'] == int(user_id), 'approved'] = True
                 users.to_csv(self.users_file, index=False)
-
             await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен администратором!")
             await update.message.reply_text(f"✅ Пользователь {user_id} одобрен")
             await self.bot.send_message(
                 chat_id=user_id,
-                text="✅ <b>Ваш аккаунт одобрен!</b>\n\n"
+                text="✅ Ваш аккаунт одобрен!\n\n"
                      "Теперь вам доступны команды:\n"
                      "/help - Справка\n"
                      "/subscribe - Подписка\n"
@@ -613,7 +715,6 @@ class TelegramBot:
                      "/history - Топ игроков\n",
                 parse_mode=ParseMode.HTML
             )
-
         except Exception as e:
             logging.error(f"Error in approve_user: {e}")
             await update.message.reply_text("Произошла ошибка при одобрении пользователя.")
@@ -621,7 +722,6 @@ class TelegramBot:
     async def list_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not await self._check_admin(update, "list_users"):
             return
-
         users = pd.read_csv(self.users_file)
         text = "📋 *Список пользователей:*\n"
         for _, row in users.iterrows():
@@ -630,17 +730,35 @@ class TelegramBot:
         await update.message.reply_text(text, parse_mode='Markdown')
 
     async def send_message_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Команда для отправки сообщения конкретному пользователю с поддержкой картинок."""
         if not await self._check_admin(update, "send"):
             return
-
         if not context.args or len(context.args) < 2:
             await update.message.reply_text("❌ Формат: /send <ID> <сообщение>")
             return
-
-        user_id, message = context.args[0], " ".join(context.args[1:])
+        target_user_id = context.args[0]
+        # Остальные аргументы составляют сообщение
+        caption = " ".join(context.args[1:]).strip()
+        safe_caption = escape_markdown(caption, version=2)
+        # Если в сообщении присутствует фото, получаем его file_id
+        photo_file_id = None
+        if update.message.photo:
+            photo_file_id = update.message.photo[-1].file_id
         try:
-            await self.bot.send_message(chat_id=user_id, text=f"🔔 Сообщение от админа:\n{message}")
-            await update.message.reply_text("✅ Сообщение отправлено")
+            if photo_file_id:
+                await self.bot.send_photo(
+                    chat_id=target_user_id,
+                    photo=photo_file_id,
+                    caption=safe_caption if safe_caption else None,
+                    parse_mode='MarkdownV2'
+                )
+            else:
+                await self.bot.send_message(
+                    chat_id=target_user_id,
+                    text=safe_caption,
+                    parse_mode='MarkdownV2'
+                )
+            await update.message.reply_text("✅ Сообщение отправлено!")
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
@@ -651,22 +769,19 @@ class TelegramBot:
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
-
         try:
             data = query.data.split('_')
             action = data[0]
             user_id = data[1]
-
             if action == "approve":
                 with self.users_lock:
                     users = pd.read_csv(self.users_file)
                     users.loc[users['user_id'] == int(user_id), 'approved'] = True
                     users.to_csv(self.users_file, index=False)
-
                 await self.bot.send_message(chat_id=user_id, text="✅ Ваш аккаунт одобрен!")
                 await self.bot.send_message(
                     chat_id=user_id,
-                    text="✅ <b>Одобрено!</b>\n\n"
+                    text="✅ Одобрено!\n\n"
                          "Доступные команды:\n"
                          "/help - Помощь\n"
                          "/subscribe - Уведомления\n"
@@ -678,7 +793,6 @@ class TelegramBot:
                     await query.edit_message_text(text=f"Пользователь {user_id} одобрен")
                 else:
                     await query.message.reply_text(f"Пользователь {user_id} одобрен")
-
             elif action == "reject":
                 # Логика отклонения заявки
                 with self.users_lock:
@@ -729,33 +843,60 @@ class TelegramBot:
     async def history(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         users = pd.read_csv(self.users_file)
-
         if user_id not in users['user_id'].astype(str).values:
             await update.message.reply_text("❌ Вы не зарегистрированы.")
             return
-
         history = self.monitor.get_top_players()
         response = "📜 Топ активных игроков:\n"
         for player, time in history:
             response += f"{player}: {time // 60} минут\n"
-
         await update.message.reply_text(response)
 
     async def help_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = str(update.effective_user.id)
         is_admin = self.monitor.security.is_admin(user_id)
 
-        help_text = "🛠 <b>Доступные команды</b>\n\n"
-        help_text += "<b>Основные:</b>\n"
-        help_text += "/help - Справка\n/subscribe - Подписка\n/unsubscribe - Отписка\n"
-        help_text += "/history - Топ игроков\n/track (ник) - Трекинг игрока\n/untrack (ник) - Остановить трекинг\n\n"
+        help_text = (
+            "🌀 *Доступные команды* 🌀\n"
+            "▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️▫️\n\n"
+
+            "🔹 *Основные команды:*\n"
+            "/start - Регистрация в системе\n"
+            "/help - Это меню\n"
+            "/subscribe - Подписаться на уведомления\n"
+            "/unsubscribe - Отписаться от уведомлений\n"
+            "/history - Топ активных игроков\n\n"
+
+            "🔹 *Трекинг игроков:*\n"
+            "/track [ник] - Начать отслеживание\n"
+            "/untrack [ник] - Остановить отслеживание\n"
+            "/player_report [ник] - Полный отчет по игроку\n\n"
+        )
 
         if is_admin:
-            help_text += "<b>Админ:</b>\n"
-            help_text += "/users - Список\n/approve - Одобрить\n/send - Сообщение\n/anomalies - Проверка\n/heatmap - Зоны\n/player_report - Отчёт\n"
+            help_text += (
+                "👑 *Административные команды:*\n"
+                "/users - Список пользователей\n"
+                "/approve [ID] - Одобрить доступ\n"
+                "/send [ID] [текст] - Отправить сообщение\n"
+                "/broadcast [текст] - Рассылка всем\n"
+                "/anomalies [скорость] [дистанция] - Проверить аномалии\n"
+                "/heatmap - Отчет по активным зонам\n"
+                "/caramel_pain - Секретная команда\n\n"
+            )
 
-        await update.message.reply_text(help_text, parse_mode=ParseMode.HTML)
+        help_text += (
+            "⚠️ *Важно:*\n"
+            "• Команды с [ник] требуют указания имени игрока\n"
+            "• Для трекинга нужны права доступа\n"
+            "• Админ-команды видны только администраторам"
+        )
 
+        await update.message.reply_text(
+            help_text,
+            parse_mode=ParseMode.MARKDOWN_V2,
+            disable_web_page_preview=True
+        )
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("ℹ Используйте /help для списка команд")
 
@@ -794,33 +935,44 @@ class TelegramBot:
         await update.message.reply_text(result)
 
     async def player_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """
-        Команда: /player_report <имя игрока>
-        Отчёт по времени игрока и активности по зонам.
-        """
-        if not await self._check_admin(update, "player_report"):
-            return
-
         if not context.args:
             await update.message.reply_text("❌ Используйте: /player_report <имя игрока>")
             return
-
         player_name = " ".join(context.args)
-        result = self.analytics.generate_player_report(player_name)
-        await update.message.reply_text(result, parse_mode='Markdown')
+        try:
+            # Экранируем имя перед использованием
+            safe_name = escape_markdown(player_name, version=2)
+            report = await self.analytics.generate_player_report(safe_name)
+            # Экранируем весь отчет перед отправкой
+            safe_report = escape_markdown(report, version=2)
+            # Заменяем неправильные символы и форматируем правильно
+            safe_report = safe_report.replace("sports_esports", "🎮")
+            safe_report = safe_report.replace("emoji_events", "🏆")
+            safe_report = safe_report.replace("historyЗаходил:", "Заходил:")
+            safe_report = safe_report.replace("Наиграно:", "Наиграно:")
+            await update.message.reply_text(safe_report, parse_mode=ParseMode.MARKDOWN_V2)
+        except Exception as e:
+            logging.error(f"Ошибка генерации отчёта: {str(e)}")
+            await update.message.reply_text("❌ Произошла ошибка при генерации отчёта")
 
     async def broadcast_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Команда для рассылки сообщения всем пользователям."""
+        """Команда для рассылки сообщения всем пользователям, с поддержкой отправки картинок."""
         if not await self._check_admin(update, "broadcast"):
             return
 
-        if not context.args:
-            await update.message.reply_text("❌ Использование: /broadcast <текст сообщения>")
-            return
+        # Если в сообщении присутствует фото, получаем его file_id
+        photo_file_id = None
+        if update.message.photo:
+            # Выбираем самое большое фото (последнее в списке)
+            photo_file_id = update.message.photo[-1].file_id
 
-        message = " ".join(context.args).strip()
-        safe_message = escape_markdown(message, version=2)
+        # Текст сообщения можно передавать через аргументы команды
+        caption = " ".join(context.args).strip()
 
+        # Если картинка есть, используем caption; иначе – обычное текстовое сообщение
+        safe_caption = escape_markdown(caption, version=2)
+
+        # Чтение списка пользователей из файла
         users = pd.read_csv(self.users_file)
         approved_users = users[users['approved'] & users['subscribed']]
 
@@ -829,13 +981,23 @@ class TelegramBot:
 
         for user_id in approved_users['user_id']:
             try:
-                await self.bot.send_message(
-                    chat_id=str(user_id),
-                    text=safe_message,
-                    parse_mode='MarkdownV2'
-                )
+                if photo_file_id:
+                    # Отправка фото с подписью
+                    await self.bot.send_photo(
+                        chat_id=str(user_id),
+                        photo=photo_file_id,
+                        caption=safe_caption if safe_caption else None,
+                        parse_mode='MarkdownV2'
+                    )
+                else:
+                    # Отправка обычного текстового сообщения
+                    await self.bot.send_message(
+                        chat_id=str(user_id),
+                        text=safe_caption,
+                        parse_mode='MarkdownV2'
+                    )
                 sent_count += 1
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.3)  # Задержка для предотвращения rate limit
             except Exception as e:
                 logging.error(f"Ошибка отправки пользователю {user_id}: {str(e)}")
                 failed_count += 1
@@ -879,7 +1041,6 @@ class NoSos:
         self.config.setdefault('database', {'filename': 'activity.db'})
         self.config.setdefault('language', 'ru')
         self.config.setdefault('themes', {'default': 'dark'})
-
         self.label_objects = []
         self.db_queue = queue.Queue()
         self.gui_update_queue = queue.Queue()
@@ -887,7 +1048,6 @@ class NoSos:
         self.temp_db_queue = queue.Queue()
         self.start_temp_db_handler()
         self.alert_texts = []
-
         self.alert_manager = AlertManager()
         self.setup_plot()
         self.init_data_structures()
@@ -1352,13 +1512,18 @@ class NoSos:
         cache_key = (x, z, zone['name'])
         if cache_key in self.zone_cache:
             return self.zone_cache[cache_key]
-
         in_zone = (
                 zone["bounds"]["xmin"] <= x <= zone["bounds"]["xmax"] and
                 zone["bounds"]["zmin"] <= z <= zone["bounds"]["zmax"]
         )
         self.zone_cache[cache_key] = in_zone
         return in_zone
+
+    def get_zone_name_by_coordinates(self, x, z):
+        for zone in self.config["alerts"]["zones"]:
+            if self.is_in_zone(x, z, zone):
+                return zone["name"]
+        return None
 
     @lru_cache(maxsize=32)
     def fetch_data(self):
