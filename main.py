@@ -80,6 +80,7 @@ class PlayerParser:
     BASE_URL = "https://serverchichi.online/player/"
 
     @staticmethod
+    @lru_cache(maxsize=500)
     async def fetch_player_page(player_name: str) -> str:
         url = f"{PlayerParser.BASE_URL}{player_name}"
         async with aiohttp.ClientSession() as session:
@@ -90,6 +91,7 @@ class PlayerParser:
                 return await response.text()
 
     @staticmethod
+    @lru_cache(maxsize=500)
     async def parse_player_profile(player_name: str) -> dict:
         html_content = await PlayerParser.fetch_player_page(player_name)
         if not html_content:
