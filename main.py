@@ -82,7 +82,6 @@ class PlayerParser:
     BASE_URL = "https://serverchichi.online/player/"
 
     @staticmethod
-    @lru_cache(maxsize=500)
     async def fetch_player_page(player_name: str) -> str:
         url = f"{PlayerParser.BASE_URL}{player_name}"
         async with aiohttp.ClientSession() as session:
@@ -92,12 +91,20 @@ class PlayerParser:
                     return ""
                 return await response.text()
 
-    @staticmethod
-    @lru_cache(maxsize=500)
-    async def parse_player_profile(player_name: str) -> dict:
-        html_content = await PlayerParser.fetch_player_page(player_name)
+    _cache = {}
+
+    @classmethod
+    async def parse_player_profile(cls, player_name: str) -> dict:
+        # Проверка кэша
+        cache_key = player_name.lower()
+        if cache_key in cls._cache:
+            return cls._cache[cache_key]  # Return the cached result directly
+
+        # Выполнение запроса
+        html_content = await cls.fetch_player_page(player_name)
         if not html_content:
             return {}
+
         soup = BeautifulSoup(html_content, 'html.parser')
         player_data = {}
 
@@ -113,13 +120,11 @@ class PlayerParser:
 
         # Парсим роли
         roles_section = soup.find('div', class_='roles')
-        player_data['roles'] = [role.get_text(strip=True) for role in
-                                roles_section.find_all('span')] if roles_section else []
+        player_data['roles'] = [role.get_text(strip=True) for role in roles_section.find_all('span')] if roles_section else []
 
         # Парсим статистику
         stats_section = soup.find('div', class_='stats')
-        player_data['stats'] = [stat.get_text(strip=True) for stat in
-                                stats_section.find_all('p')] if stats_section else []
+        player_data['stats'] = [stat.get_text(strip=True) for stat in stats_section.find_all('p')] if stats_section else []
 
         # Парсим RP-карточки
         rp_container = soup.find('div', class_='rp-container')
@@ -136,7 +141,6 @@ class PlayerParser:
         premium_section = soup.find('div', class_='player-plus-content')
         if premium_section:
             premium_text = premium_section.get_text(strip=True)
-            # Извлекаем только часть с уровнем СЧ+
             match = re.search(r'СЧ\+\s*(\d+)\s*Уровня', premium_text)
             if match:
                 player_data['player_plus'] = f"СЧ+ {match.group(1)} Уровня"
@@ -145,7 +149,13 @@ class PlayerParser:
         else:
             player_data['player_plus'] = "СЧ+ пока не куплен"
 
+        # Сохраняем результат в кэш
+        cls._cache[cache_key] = player_data
         return player_data
+
+    @classmethod
+    def clear_cache(cls):
+        cls._cache.clear()
 
 
 class BaseAlertRule(ABC):
@@ -434,7 +444,8 @@ class AnalyticsEngine:
     async def generate_player_report(self, player_name: str) -> str:
         logging.debug(f"Запрос данных для игрока: {player_name}")
         try:
-            # Получаем данные
+            # Очищаем кэш перед новым запросом
+            PlayerParser.clear_cache()
             player_history = self.monitor.get_player_history(player_name, limit=5)
             last_position = self.monitor.get_last_position(player_name)
             player_data = await PlayerParser.parse_player_profile(player_name)
@@ -917,6 +928,7 @@ class TelegramBot:
 
         player_name = " ".join(context.args)
         try:
+            PlayerParser.clear_cache()
             # Генерируем исходный отчёт
             raw_report = await self.analytics.generate_player_report(player_name)
 
@@ -1074,6 +1086,7 @@ class NoSos:
         self.start_cleanup_thread()
         self.sent_alerts_cache = set()
         self.alert_cache_lock = threading.Lock()
+        PlayerParser.clear_cache()
 
     def start_cleanup_thread(self):
         """Поток для очистки устаревших данных"""
