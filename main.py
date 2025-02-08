@@ -1,4 +1,5 @@
 import asyncio
+import tempfile
 import csv
 import json
 import logging
@@ -44,9 +45,10 @@ from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 
 if getattr(sys, 'frozen', False):
-    BASE_DIR = sys._MEIPASS  # type: ignore
+    BASE_DIR = sys._MEIPASS
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.yaml')
 request = HTTPXRequest()
 matplotlib.use('Qt5Agg')
@@ -912,19 +914,56 @@ class TelegramBot:
         if not context.args:
             await update.message.reply_text("❌ Используйте: /player_report <имя игрока>")
             return
+
         player_name = " ".join(context.args)
         try:
-            # Экранируем имя перед использованием
-            safe_name = escape_markdown(player_name, version=2)
-            report = await self.analytics.generate_player_report(safe_name)
-            # Экранируем весь отчет перед отправкой
-            safe_report = escape_markdown(report, version=2)
-            # Заменяем неправильные символы и форматируем правильно
-            safe_report = safe_report.replace("sports_esports", "🎮")
-            safe_report = safe_report.replace("emoji_events", "🏆")
-            safe_report = safe_report.replace("historyЗаходил:", "Заходил:")
-            safe_report = safe_report.replace("Наиграно:", "Наиграно:")
-            await update.message.reply_text(safe_report, parse_mode=ParseMode.MARKDOWN_V2)
+            # Генерируем исходный отчёт
+            raw_report = await self.analytics.generate_player_report(player_name)
+
+            # Обработка специальных символов для текстовой версии
+            processed_report = (
+                raw_report
+                .replace("sports_esports", "🎮")
+                .replace("emoji_events", "🏆")
+                .replace("historyЗаходил:", "Заходил:")
+                .replace("Наиграно:", "Наиграно:")
+            )
+
+            # Создаём две версии: для текста и для файла
+            text_report = escape_markdown(processed_report, version=2)
+            file_report = processed_report  # Версия без экранирования для файла
+
+            MAX_LENGTH = 4096
+            if len(text_report) > MAX_LENGTH:
+                # Создаём временный файл
+                with tempfile.NamedTemporaryFile(
+                        mode='w+',
+                        encoding='utf-8',
+                        suffix='.txt',
+                        delete=False
+                ) as temp_file:
+                    temp_file.write(file_report)
+                    temp_file_name = temp_file.name
+
+                # Отправляем файл
+                with open(temp_file_name, 'rb') as file:
+                    await context.bot.send_document(
+                        chat_id=update.effective_chat.id,
+                        document=file,
+                        filename=f"Отчёт_{player_name}.txt",
+                        caption=f"📁 Полный отчёт по игроку {player_name}"
+                    )
+
+                # Удаляем временный файл
+                os.unlink(temp_file_name)
+            else:
+                # Отправляем как текстовое сообщение
+                await update.message.reply_text(
+                    text_report,
+                    parse_mode=ParseMode.MARKDOWN_V2,
+                    disable_web_page_preview=True
+                )
+
         except Exception as e:
             logging.error(f"Ошибка генерации отчёта: {str(e)}")
             await update.message.reply_text("❌ Произошла ошибка при генерации отчёта")
