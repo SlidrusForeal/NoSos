@@ -44,7 +44,7 @@ from telegram.helpers import escape_markdown
 from telegram.request import HTTPXRequest
 
 if getattr(sys, 'frozen', False):
-    BASE_DIR = sys._MEIPASS
+    BASE_DIR = sys._MEIPASS  # type: ignore
 else:
     BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, 'config.yaml')
@@ -1320,7 +1320,8 @@ class NoSos:
         try:
             if plt.get_backend().lower() == 'qt5agg':
                 manager = plt.get_current_fig_manager()
-                manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
+                if manager and hasattr(manager, 'window'):
+                    manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
         except Exception as e:
             logging.error(f"Ошибка установки иконки: {str(e)}")
         self.ax = self.fig.add_subplot(111)
@@ -1748,8 +1749,8 @@ class NoSos:
             )
 
     def setup_labels(self):
-        self.ax.set_xlim(self.world_bounds[0], self.world_bounds[1])
-        self.ax.set_ylim(self.world_bounds[2], self.world_bounds[3])
+        self.ax.set_xlim((self.world_bounds[0], self.world_bounds[1]))
+        self.ax.set_ylim((self.world_bounds[2], self.world_bounds[3]))
         self.ax.set_title(f"Карта активности игроков ({datetime.now().strftime('%H:%M:%S')})",
                           color='white', fontsize=12, pad=20)
         self.ax.grid(color='#404040', linestyle='--', linewidth=0.7)
