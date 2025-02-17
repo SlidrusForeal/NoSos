@@ -1,9 +1,9 @@
-players_url: "https://map.serverchichi.online/maps/world/live/players.json"
+players_url: "https://map.prdx.so/rp/overworld/tiles/players.json"
 world_bounds:
-  xmin: -10145
-  xmax: 10145
-  zmin: -10078
-  zmax: 10078
+  xmin: -25000
+  xmax: 25000
+  zmin: -25000
+  zmax: 25000
 update_interval: 15
 min_request_interval: 5
 display:
@@ -29,17 +29,13 @@ security:
 database:
   filename: "activity.db"
 telegram:
-  token: "7998680701:AAFLhnk1YmoKR3HDwct8VBQiPvhz9FOGk7U"
+  token: "7998680701:AAHqrNizEmVGiUNx9OCnidkvb6kGNkuWwr4"
   chat_id: "833655522"
   admin_commands: ["/approve", "/users"]
 alerts:
   zones:
     - name: "Спавн"
-      bounds:
-        xmin: -500
-        xmax: 500
-        zmin: -500
-        zmax: 500
+      bounds: { xmin: -294, xmax: 220, zmin: -252, zmax: 266 }
       allowed_players: []
       alert_level: "INFO"
       cooldown: 30
@@ -50,11 +46,7 @@ alerts:
         duration: 1000
 
     - name: "Сосмарк"
-      bounds:
-        xmin: 4124
-        xmax: 5291
-        zmin: -3465
-        zmax: -2225
+      bounds: { xmin: -3150, xmax: -2448, zmin: 2266, zmax: 3206 }
       allowed_players:
         - "K1zik"
         - "KomJys"
@@ -70,7 +62,7 @@ alerts:
         - "BotEnot"
         - "_mixailchert_"
         - "VuLo4ka"
-        - "Aphgust"
+        - "Aphgust_"
         - "Sir_Bred"
         - "Timondarck"
         - "italianopelmen"
@@ -83,100 +75,8 @@ alerts:
       cooldown: 60
       excluded: False
 
-    # Новые зоны с excluded: True
-    - name: "Евгенбург"
-      bounds: {xmin: -878, xmax: -282, zmin: 471, zmax: 900}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Redplate"
-      bounds: {xmin: 1039, xmax: 1857, zmin: 803, zmax: 1431}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Бодлэнд"
-      bounds: {xmin: 1820, xmax: 2250, zmin: 1148, zmax: 1708}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Нексус-9"
-      bounds: {xmin: -3230, xmax: -2526, zmin: 4951, zmax: 5594}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Эсторская Республика"
-      bounds: {xmin: 5777, xmax: 7079, zmin: -4944, zmax: -4124}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Сайкен"
-      bounds: {xmin: -9780, xmax: -9178, zmin: 12, zmax: 990}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Гримбург"
-      bounds: {xmin: -4078, xmax: -3193, zmin: -1333, zmax: -539}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Черномория"
-      bounds: {xmin: 1996, xmax: 3845, zmin: 3541, zmax: 5907}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "СудовАпатов"
-      bounds: {xmin: -561, xmax: 345, zmin: -3770, zmax: -2683}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "ЧиллХата"
-      bounds: {xmin: 4861, xmax: 6082, zmin: -609, zmax: 323}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Город чепуша"
-      bounds: {xmin: -3953, xmax: -3373, zmin: -3329, zmax: -2856}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Телория"
-      bounds: {xmin: -1642, xmax: -1012, zmin: -1521, zmax: -744}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
-    - name: "Мединск"
-      bounds: {xmin: -806, xmax: -589, zmin: -322, zmax: 476}
-      allowed_players: []
-      alert_level: "INFO"
-      cooldown: 60
-      excluded: True
-
   limits:
-    max_players: 50
+    max_players: 200
     alert_level: "CRITICAL"
   movement_anomaly:
     max_speed: 50
