@@ -6,7 +6,6 @@ import logging
 import os
 import pickle
 import queue
-import random
 import re
 import sqlite3
 import sys
@@ -54,10 +53,10 @@ request = HTTPXRequest()
 matplotlib.use('Qt5Agg')
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(threadName)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('monitor.log', encoding='utf-8'),
-        logging.StreamHandler()
+        logging.FileHandler('debug.log'),
+        logging.StreamHandler(),
     ]
 )
 
@@ -532,6 +531,7 @@ class TelegramBot:
         self.player_history = defaultdict(lambda: {"x": 0, "z": 0})  # Последние координаты
         self._init_users_file()
         self._register_handlers()
+        self.player_report_under_maintenance = True
         self.analytics = AnalyticsEngine(monitor)
 
     def _init_users_file(self):
@@ -547,7 +547,6 @@ class TelegramBot:
             CommandHandler("approve", self.approve_user),
             CommandHandler("users", self.list_users),
             CommandHandler("send", self.send_message_command),
-            CommandHandler("caramel_pain", self.caramel_pain_command),
             CommandHandler("history", self.history),
             CommandHandler("subscribe", self.subscribe),
             CommandHandler("track", self.track_player),
@@ -555,6 +554,7 @@ class TelegramBot:
             CommandHandler("anomalies", self.anomalies),
             CommandHandler("heatmap", self.heatmap),
             CommandHandler("player_report", self.player_report),
+            CommandHandler("maintance", self.maintance),
             CommandHandler("broadcast", self.broadcast_message),
             CallbackQueryHandler(self.handle_callback),
             MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message),
@@ -562,6 +562,13 @@ class TelegramBot:
         for handler in handlers:
             self.app.add_handler(handler)
 
+    async def maintance(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Только администратор может переключать режим обслуживания
+        if not await self._check_admin(update, "maintance"):
+            return
+        self.player_report_under_maintenance = not self.player_report_under_maintenance
+        status = "включён" if self.player_report_under_maintenance else "выключен"
+        await update.message.reply_text(f"✅ Режим обслуживания для /player_report {status}.")
     async def _check_admin(self, update: Update, command_name: str = None) -> bool:
         user = update.effective_user
         user_id = str(user.id)
@@ -581,24 +588,23 @@ class TelegramBot:
                 f"• Команда: `{command}`\n"
                 f"• Время: {timestamp}"
             )
-            # Экранируем зарезервированные символы в сообщении
             admin_alert = escape_markdown(admin_alert, version=2)
-            # Отправляем уведомление админу
-            logging.info(f"Отправка уведомления админу: {admin_alert}")  # Добавлено логирование
+
+            logging.info(f"Отправка уведомления админу: {admin_alert}")
             await self.bot.send_message(
                 chat_id=self.admin_id,
                 text=admin_alert,
                 parse_mode='MarkdownV2'
             )
-            # Логируем событие
+
             logging.warning(f"Несанкционированный доступ к команде {command} от {user_id} ({user.full_name})")
-            # Отправляем сообщение пользователю
+
             await update.message.reply_text(
                 "⛔ Ты адекатная? А ничо тот факт что ты не администратор бота и у тебя жижа за 50 рублей купленая у ашота. \n жди докс короче")
             return False
         except Exception as e:
             logging.error(f"Ошибка отправки уведомления админу: {str(e)}")
-            # Отправляем сообщение пользователю
+
             await update.message.reply_text("⛔ У вас нет прав для выполнения этой команды.")
             return False
 
@@ -609,7 +615,7 @@ class TelegramBot:
             await update.message.reply_text("❌ Укажите ник игрока: /track <ник>")
             return
         player_name = " ".join(context.args).strip()
-        # Проверка прав доступа
+
         with self.users_lock:
             users = pd.read_csv(self.users_file)
             user = users[users['user_id'] == int(user_id)]
@@ -781,10 +787,6 @@ class TelegramBot:
         except Exception as e:
             await update.message.reply_text(f"❌ Ошибка: {str(e)}")
 
-    async def caramel_pain_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        responses = ["Кто такие мышериоты?", "La-Li-Lu-Le-Lo", "Shin Sei Moku Roku"]
-        await update.message.reply_text(f"🔐 {random.choice(responses)}")
-
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         await query.answer()
@@ -922,17 +924,19 @@ class TelegramBot:
         await update.message.reply_text(result)
 
     async def player_report(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        # Проверяем, включён ли режим обслуживания для команды
+        if self.player_report_under_maintenance:
+            await update.message.reply_text(
+                "ℹ️ Команда /player_report сейчас находится на обслуживании. Попробуйте позже.")
+            return
+
         if not context.args:
             await update.message.reply_text("❌ Используйте: /player_report <имя игрока>")
             return
-
         player_name = " ".join(context.args)
         try:
             PlayerParser.clear_cache()
-            # Генерируем исходный отчёт
             raw_report = await self.analytics.generate_player_report(player_name)
-
-            # Обработка специальных символов для текстовой версии
             processed_report = (
                 raw_report
                 .replace("sports_esports", "🎮")
@@ -940,14 +944,10 @@ class TelegramBot:
                 .replace("historyЗаходил:", "Заходил:")
                 .replace("Наиграно:", "Наиграно:")
             )
-
-            # Создаём две версии: для текста и для файла
             text_report = escape_markdown(processed_report, version=2)
-            file_report = processed_report  # Версия без экранирования для файла
-
+            file_report = processed_report
             MAX_LENGTH = 4096
             if len(text_report) > MAX_LENGTH:
-                # Создаём временный файл
                 with tempfile.NamedTemporaryFile(
                         mode='w+',
                         encoding='utf-8',
@@ -956,8 +956,6 @@ class TelegramBot:
                 ) as temp_file:
                     temp_file.write(file_report)
                     temp_file_name = temp_file.name
-
-                # Отправляем файл
                 with open(temp_file_name, 'rb') as file:
                     await context.bot.send_document(
                         chat_id=update.effective_chat.id,
@@ -965,17 +963,13 @@ class TelegramBot:
                         filename=f"Отчёт_{player_name}.txt",
                         caption=f"📁 Полный отчёт по игроку {player_name}"
                     )
-
-                # Удаляем временный файл
                 os.unlink(temp_file_name)
             else:
-                # Отправляем как текстовое сообщение
                 await update.message.reply_text(
                     text_report,
                     parse_mode=ParseMode.MARKDOWN_V2,
                     disable_web_page_preview=True
                 )
-
         except Exception as e:
             logging.error(f"Ошибка генерации отчёта: {str(e)}")
             await update.message.reply_text("❌ Произошла ошибка при генерации отчёта")
@@ -1045,10 +1039,10 @@ class TelegramBot:
         return re.sub(r'[^a-zA-Z0-9_]', '', name).lower()
 
 
-class NoSos:
+class EFIS:
     def __init__(self):
-        self.window_title = "NoSos"
-        self.icon_path = "icon.ico"
+        self.window_title = "EFIS"
+        self.icon_path = "EFIS.ico"
         self.users_file = "users.csv"
         self.stop_event = threading.Event()  # Инициализация stop_event здесь
         self.config = self.load_config()
@@ -1376,7 +1370,6 @@ class NoSos:
                     manager.window.setWindowIcon(QtGui.QIcon(self.icon_path))
         except Exception as e:
             logging.error(f"Ошибка установки иконки: {str(e)}")
-        self.ax = self.fig.add_subplot(111)
 
     def setup_controls(self):
         self.player_list_ax = self.fig.add_axes([0.72, 0.25, 0.25, 0.70])
@@ -1578,7 +1571,17 @@ class NoSos:
     def fetch_and_process_data(self):
         try:
             all_players = self.fetch_data()
-            filtered_players = [p for p in all_players if not p.get('foreign', False)]
+            # Фильтрация по миру и преобразование структуры данных
+            filtered_players = [
+                {
+                    "name": p["name"],
+                    "position": {"x": p["x"], "z": p["z"]},
+                    "uuid": p["uuid"],
+                    "world": p["world"]
+                }
+                for p in all_players
+                if p["world"] == "minecraft_overworld"
+            ]
 
             with self.data_lock:
                 self.current_data = filtered_players
@@ -1587,8 +1590,8 @@ class NoSos:
                 )
                 self.gui_update_queue.put(self.update_player_list_text)
 
-            # Передача данных в AlertManager для проверки алертов
-            self.alert_manager.process_data({"players": filtered_players})  # <-- Добавлено
+            # Передача данных в AlertManager
+            self.alert_manager.process_data({"players": filtered_players})
             self.process_player_movements(filtered_players)
             self.fetch_data.cache_clear()
 
@@ -1671,16 +1674,32 @@ class NoSos:
 
     def draw_heatmap(self):
         try:
+            # Проверяем наличие данных и их достаточность
             if not self.historical_data or len(self.historical_data) < 10:
+                logging.info("Недостаточно данных для построения тепловой карты.")
                 return
 
-            x, z = zip(*self.historical_data)
-            x = [xi for xi in x if self.world_bounds[0] <= xi <= self.world_bounds[1]]
-            z = [zi for zi in z if self.world_bounds[2] <= zi <= self.world_bounds[3]]
+            # Фильтруем данные в пределах границ мира
+            filtered = [
+                (xi, zi) for xi, zi in self.historical_data
+                if self.world_bounds[0] <= xi <= self.world_bounds[1]
+                   and self.world_bounds[2] <= zi <= self.world_bounds[3]
+            ]
 
-            if not x or not z:
+            # Если отфильтрованные данные пусты, выходим из функции
+            if not filtered:
+                logging.info("Нет данных в заданных границах для построения тепловой карты.")
                 return
 
+            # Разделяем координаты x и z
+            x, z = zip(*filtered)
+
+            # Дополнительная проверка на соответствие длин массивов
+            if len(x) != len(z):
+                logging.error(f"Ошибка: Несоответствие длин массивов x и z. len(x)={len(x)}, len(z)={len(z)}")
+                return
+
+            # Построение тепловой карты
             self.ax.hist2d(
                 x, z,
                 bins=self.config["heatmap"]["bins"],
@@ -1690,8 +1709,10 @@ class NoSos:
                 range=self.get_heatmap_bins(),
                 density=True
             )
+
         except Exception as e:
-            logging.error(f"Ошибка тепловой карты: {str(e)}")
+            # Логирование ошибки с подробной информацией
+            logging.error(f"Произошла ошибка при построении тепловой карты: {str(e)}", exc_info=True)
 
     def update_plot(self, frame):
         try:
@@ -1963,16 +1984,35 @@ class NoSos:
 
     def load_history(self):
         try:
-            if os.path.exists(self.config["heatmap"]["history_file"]):
-                with open(self.config["heatmap"]["history_file"], 'rb') as f:
-                    history = pickle.load(f)
-                with self.data_lock:
-                    self.historical_data.extend(history)
-                logging.info(f"Загружено записей истории: {len(history)}")
+            # Проверяем существование файла и его размер
+            if not os.path.exists('history.pkl') or os.path.getsize('history.pkl') == 0:
+                # Если файл отсутствует или пуст, создаем пустой список истории
+                self.history = []
+                logging.info("Файл истории отсутствует или пуст. Создан пустой список.")
+                return
+
+            # Открываем файл для чтения в двоичном режиме
+            with open('history.pkl', 'rb') as f:
+                # Загружаем данные из файла
+                self.history = pickle.load(f)
+                logging.info("История успешно загружена.")
+
+        except EOFError:
+            # Обработка случая, когда файл существует, но он пуст
+            self.history = []
+            logging.info("EOFError: Файл истории пуст. Создан пустой список.")
+
+        except pickle.UnpicklingError as e:
+            # Обработка ошибок при десериализации данных
+            logging.error(f"Ошибка при десериализации данных из файла истории: {e}")
+            self.history = []  # Инициализируем пустым списком, чтобы избежать проблем
+
         except Exception as e:
-            logging.error(f"Ошибка загрузки истории: {str(e)}")
+            # Обработка других возможных исключений
+            logging.error(f"Произошла ошибка при загрузке истории: {e}", exc_info=True)
+            self.history = []  # Инициализируем пустым списком для безопасности
 
 
 if __name__ == "__main__":
-    monitor = NoSos()
+    monitor = EFIS()
     monitor.run()
