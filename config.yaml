@@ -1,4 +1,4 @@
-players_url: "https://map.prdx.so/rp/overworld/tiles/players.json"
+players_url: "MINECRAFT SERVER MAP URL"
 world_bounds:
   xmin: -25000
   xmax: 25000
@@ -23,14 +23,14 @@ display:
     y_offset: 8
 security:
   admins:
-    - "833655522"
+    - "ADMINCHAT"
   log_file: "security.log"
   alert_on_unauthorized: true
 database:
   filename: "activity.db"
 telegram:
-  token: "7998680701:AAHqrNizEmVGiUNx9OCnidkvb6kGNkuWwr4"
-  chat_id: "833655522"
+  token: "BOTTOKEN"
+  chat_id: "ADMINCHAT"
   admin_commands: ["/approve", "/users"]
 alerts:
   zones:
@@ -44,36 +44,6 @@ alerts:
       sound_params:
         frequency: 2000
         duration: 1000
-
-    - name: "Сосмарк"
-      bounds: { xmin: -3150, xmax: -2448, zmin: 2266, zmax: 3206 }
-      allowed_players:
-        - "K1zik"
-        - "KomJys"
-        - "MrSemper"
-        - "Kwakich"
-        - "_DeN41k_"
-        - "Bruno_Hempf"
-        - "Sanplay11"
-        - "Panzergrenadier"
-        - "napacoJlbka"
-        - "Amoliper"
-        - "Chestz"
-        - "BotEnot"
-        - "_mixailchert_"
-        - "VuLo4ka"
-        - "Aphgust_"
-        - "Sir_Bred"
-        - "Timondarck"
-        - "italianopelmen"
-        - "BaBiEdA"
-        - "poshelyanaher"
-        - "Peridotik"
-        - "_ChesTer_aD"
-        - "RockVandal"
-      alert_level: "CRITICAL"
-      cooldown: 60
-      excluded: False
 
   limits:
     max_players: 200
