@@ -452,9 +452,53 @@ class NOSOS:
         except Exception as e:
             logging.error(f"Ошибка обработки данных: {e}")
 
+    def get_heatmap_bins(self):
+        return [
+            [self.world_bounds[0], self.world_bounds[1]],
+            [self.world_bounds[2], self.world_bounds[3]]
+        ]
+
     def draw_heatmap(self):
-        # Имплементация отрисовки тепловой карты
-        pass
+        try:
+            # Проверяем наличие данных и их достаточность
+            if not self.historical_data or len(self.historical_data) < 10:
+                logging.info("Недостаточно данных для построения тепловой карты.")
+                return
+
+            # Фильтруем данные в пределах границ мира
+            filtered = [
+                (xi, zi) for xi, zi in self.historical_data
+                if self.world_bounds[0] <= xi <= self.world_bounds[1]
+                   and self.world_bounds[2] <= zi <= self.world_bounds[3]
+            ]
+
+            # Если отфильтрованные данные пусты, выходим из функции
+            if not filtered:
+                logging.info("Нет данных в заданных границах для построения тепловой карты.")
+                return
+
+            # Разделяем координаты x и z
+            x, z = zip(*filtered)
+
+            # Дополнительная проверка на соответствие длин массивов
+            if len(x) != len(z):
+                logging.error(f"Ошибка: Несоответствие длин массивов x и z. len(x)={len(x)}, len(z)={len(z)}")
+                return
+
+            # Построение тепловой карты
+            self.ax.hist2d(
+                x, z,
+                bins=self.config["heatmap"]["bins"],
+                cmap=self.config["heatmap"]["cmap"],
+                alpha=self.config["heatmap"]["alpha"],
+                zorder=-1,
+                range=self.get_heatmap_bins(),
+                density=True
+            )
+
+        except Exception as e:
+            # Логирование ошибки с подробной информацией
+            logging.error(f"Произошла ошибка при построении тепловой карты: {str(e)}", exc_info=True)
 
     def draw_players(self):
         with self.data_lock:
