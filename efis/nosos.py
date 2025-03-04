@@ -71,13 +71,19 @@ class NOSOS:
         threading.Thread(target=cleanup_worker, daemon=True).start()
 
     def send_notifications(self, alert):
+        """Асинхронная отправка уведомления в Telegram."""
         try:
-            loop = self.telegram_bot.app._loop
-            asyncio.run_coroutine_threadsafe(self._async_send_alert(alert), loop)
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._async_send_alert(alert))  # Запускаем в текущем event loop
+        except RuntimeError:  # Если нет event loop, создаём новый
+            new_loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(new_loop)
+            new_loop.run_until_complete(self._async_send_alert(alert))
         except Exception as e:
             logging.error(f"Ошибка отправки уведомления: {e}")
 
     async def _async_send_alert(self, alert):
+        from telegram.helpers import escape_markdown
         try:
             if not alert.message.strip():
                 logging.error("Пустое сообщение алерта")
@@ -88,6 +94,10 @@ class NOSOS:
                     logging.info(f"Алерт уже был отправлен: {alert.message}")
                     return
                 self.sent_alerts_cache.add(alert_key)
+
+            # 🛠️ Исправляем проблему с `join()`
+            player_names = [p["name"] if isinstance(p, dict) else str(p) for p in alert.metadata["players"]]
+
             if alert.source == "movement_anomaly":
                 message = (
                     f"🚨 *Превышение скорости* 🚨\n"
@@ -98,19 +108,20 @@ class NOSOS:
             elif alert.source == "zone_intrusion":
                 message = (
                     f"🚨 *Вторжение в зону {alert.metadata['zone']}* 🚨\n"
-                    f"👥 Игроки ({alert.metadata['count']}): {', '.join(alert.metadata['players'])}\n"
+                    f"👥 Игроки ({alert.metadata['count']}): {', '.join(player_names)}\n"
                     f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
                 )
             else:
                 message = (
-                    f"🚨 *Телепортация / смертьь* 🚨\n"
+                    f"🚨 *Телепортация / смерть* 🚨\n"
                     f"Источник: {alert.source.upper()}\n"
                     f"Игрок: {alert.metadata.get('player', 'Неизвестно')}\n"
                     f"🕒 {alert.timestamp.strftime('%H:%M:%S')}"
                 )
-            from telegram.helpers import escape_markdown
+
             safe_message = escape_markdown(message, version=2)
-            if alert.level.name == "CRITICAL":
+
+            if alert.level == "CRITICAL":
                 await self.bot.send_message(
                     chat_id=self.config["telegram"]["chat_id"],
                     text=safe_message,
@@ -126,7 +137,7 @@ class NOSOS:
                             text=safe_message,
                             parse_mode='MarkdownV2'
                         )
-                        await asyncio.sleep(0.3)
+                        await asyncio.sleep(0.3)  # Предотвращаем ограничение API Telegram
                     except Exception as e:
                         logging.error(f"Ошибка отправки пользователю {user_id}: {e}")
         except Exception as e:
@@ -548,15 +559,55 @@ class NOSOS:
             return self.ax
 
     def run(self):
+        import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
-        ani = FuncAnimation(self.fig, self.update_plot, interval=2000, cache_frame_data=False)
-        plt.show()
-        self.shutdown()
+        self.ani = FuncAnimation(self.fig, self.update_plot, interval=2000, cache_frame_data=False)
+
+        def on_close(event):
+            """Вызывается при закрытии окна графика."""
+            self.shutdown()
+
+        self.fig.canvas.mpl_connect("close_event", on_close)  # Привязываем `shutdown` к закрытию окна
+        plt.show()  # Теперь `shutdown()` вызовется при закрытии окна
 
     def shutdown(self):
-        self.stop_event.set()
-        self.conn.close()
-        self.temp_conn.close()
+        import asyncio
+        """Остановить анимацию и завершить приложение."""
+        if hasattr(self, 'ani'):
+            self.ani.event_source.stop()
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop and loop.is_running():
+            loop.create_task(self.async_shutdown())  # Асинхронный вызов
+        else:
+            asyncio.run(self.async_shutdown())  # Запуск нового event loop
+
+    async def async_shutdown(self):
+        """Асинхронное завершение операций перед выходом."""
+        import logging
+        logging.info("Асинхронное завершение приложения...")
+
+        # Остановка фоновых задач, если они есть
+        if hasattr(self, "background_task") and self.background_task:
+            self.background_task.cancel()
+
+        # Закрытие базы данных (если есть)
+        if hasattr(self, "db_conn") and self.db_conn:
+            await self.db_conn.close()
+
+        # Закрытие сетевых соединений (если есть)
+        if hasattr(self, "network_session") and self.network_session:
+            await self.network_session.close()
+
+        logging.info("Завершение выполнено.")
 
     def get_top_players(self, top_n=10):
+        if not hasattr(self, "player_time"):  # Проверяем, инициализирован ли атрибут
+            self.player_time = defaultdict(int)
+
         return sorted(self.player_time.items(), key=lambda x: x[1], reverse=True)[:top_n]
+

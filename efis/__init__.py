@@ -1,1 +1,1 @@
-from .nosos import EFIS
+from .nosos import NOSOS

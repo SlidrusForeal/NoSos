@@ -20,16 +20,18 @@ from telegram.ext import (
     filters,
     ContextTypes
 )
-from telegram.helpers import escape_markdown
-
 from analytics.analytics_engine import AnalyticsEngine
 from security.security_manager import SecurityManager
 from utils.helpers import clean_html_tags
+from telegram.helpers import escape_markdown
+
 
 class TelegramBot:
     def __init__(self, config, monitor, users_file='users.csv'):
         self.users_lock = threading.Lock()
         self.track_lock = threading.Lock()
+        self.alert_cache_lock = threading.Lock()
+        self.sent_alerts_cache = set()
         self.monitor = monitor
         self.config = config
         self.users_file = users_file
@@ -461,11 +463,17 @@ class TelegramBot:
             f"📢 Сообщение отправлено!\n✅ Успешно: {sent_count}\n❌ Ошибок: {failed_count}"
         )
 
+    async def _run_polling(self):
+        """Асинхронный запуск бота."""
+        await self.app.run_polling()
+
     def run(self):
-        import asyncio
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        self.app.run_polling()
+        """Запуск бота с корректным `asyncio`-циклом."""
+        try:
+            logging.info("Запуск Telegram-бота...")
+            asyncio.run(self._run_polling())
+        except Exception as e:
+            logging.error(f"Ошибка запуска бота: {e}")
 
     @staticmethod
     @lru_cache(maxsize=1000)
