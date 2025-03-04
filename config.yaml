@@ -1,11 +1,15 @@
-players_url: "MINECRAFT SERVER MAP URL"
+players_urls:
+  overworld: "MAP URL можно добавь ещё больше миров"
+
 world_bounds:
   xmin: -25000
   xmax: 25000
   zmin: -25000
   zmax: 25000
+
 update_interval: 15
 min_request_interval: 5
+
 display:
   head_zorder: 15
   label_zorder: 20
@@ -21,17 +25,21 @@ display:
     bg_color: "#000000"
     bg_alpha: 0.5
     y_offset: 8
+
 security:
   admins:
-    - "ADMINCHAT"
+    - "АЙДИ АДМИНА"
   log_file: "security.log"
   alert_on_unauthorized: true
+
 database:
   filename: "activity.db"
+
 telegram:
-  token: "BOTTOKEN"
-  chat_id: "ADMINCHAT"
+  token: "ТОКЕН БОТА"
+  chat_id: "АЙДИ АДМИНА"
   admin_commands: ["/approve", "/users"]
+
 alerts:
   zones:
     - name: "Спавн"
@@ -44,6 +52,14 @@ alerts:
       sound_params:
         frequency: 2000
         duration: 1000
+
+    - name: "SlidrusCity"
+      bounds: { xmin: -5350, xmax: -2238, zmin: 6346, zmax: 66666 }
+      allowed_players:
+      -SlidrusForeal
+      alert_level: "CRITICAL"
+      cooldown: 60
+      excluded: False
 
   limits:
     max_players: 200
