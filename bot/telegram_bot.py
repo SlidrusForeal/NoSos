@@ -9,6 +9,7 @@ from collections import defaultdict
 from datetime import datetime
 import re
 from functools import lru_cache
+import random
 
 from telegram import Update, Bot, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ParseMode
@@ -59,6 +60,7 @@ class TelegramBot:
             CommandHandler("users", self.list_users),
             CommandHandler("send", self.send_message_command),
             CommandHandler("history", self.history),
+            CommandHandler("caramel_pain", self.caramel_pain_command),
             CommandHandler("subscribe", self.subscribe),
             CommandHandler("track", self.track_player),
             CommandHandler("untrack", self.untrack_player),
@@ -79,6 +81,10 @@ class TelegramBot:
         self.player_report_under_maintenance = not self.player_report_under_maintenance
         status = "включён" if self.player_report_under_maintenance else "выключен"
         await update.message.reply_text(f"✅ Режим обслуживания для /player_report {status}.")
+
+    async def caramel_pain_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        responses = ["Кто такие мышериоты?", "La-Li-Lu-Le-Lo", "Shin Sei Moku Roku"]
+        await update.message.reply_text(f"🔐 {random.choice(responses)}")
 
     async def _check_admin(self, update: Update, command_name: str = None) -> bool:
         user = update.effective_user
@@ -468,12 +474,36 @@ class TelegramBot:
         await self.app.run_polling()
 
     def run(self):
-        """Запуск бота с корректным `asyncio`-циклом."""
+        """Запуск бота в отдельном event loop"""
         try:
             logging.info("Запуск Telegram-бота...")
-            asyncio.run(self._run_polling())
+
+            # Создаем новый event loop для потока
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+
+            # Запускаем асинхронный polling
+            loop.run_until_complete(
+                self.app.run_polling(
+                    stop_signals=None,  # Отключаем обработку сигналов
+                    close_loop=False,  # Не закрываем loop автоматически
+                    allowed_updates=Update.ALL_TYPES
+                )
+            )
+
         except Exception as e:
             logging.error(f"Ошибка запуска бота: {e}")
+        finally:
+            # Правильное асинхронное завершение
+            async def shutdown_async():
+                await self.app.stop()
+                await self.app.shutdown()
+
+            if hasattr(self, 'app'):
+                loop.run_until_complete(shutdown_async())
+
+            if loop.is_running():
+                loop.close()
 
     @staticmethod
     @lru_cache(maxsize=1000)

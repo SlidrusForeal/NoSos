@@ -602,33 +602,77 @@ class NOSOS:
             logging.error(f"Ошибка обновления графика: {e}")
             return self.ax
 
+    def stop_bot(self):
+        """Остановка бота с правильным завершением"""
+        if hasattr(self.telegram_bot, 'loop'):
+            self.telegram_bot.loop.call_soon_threadsafe(
+                self.telegram_bot.loop.stop
+            )
+
     def run(self):
         import matplotlib.pyplot as plt
         from matplotlib.animation import FuncAnimation
-        self.ani = FuncAnimation(self.fig, self.update_plot, interval=2000, cache_frame_data=False)
-
-        def on_close(event):
-            """Вызывается при закрытии окна графика."""
-            self.shutdown()
-
-        self.fig.canvas.mpl_connect("close_event", on_close)  # Привязываем `shutdown` к закрытию окна
-        plt.show()  # Теперь `shutdown()` вызовется при закрытии окна
-
-    def shutdown(self):
-        import asyncio
-        """Остановить анимацию и завершить приложение."""
-        if hasattr(self, 'ani'):
-            self.ani.event_source.stop()
 
         try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+            # Инициализация анимации
+            self.ani = FuncAnimation(
+                self.fig,
+                self.update_plot,
+                interval=2000,
+                cache_frame_data=False,
+                init_func=lambda: None  # Добавляем пустую функцию инициализации
+            )
 
-        if loop and loop.is_running():
-            loop.create_task(self.async_shutdown())  # Асинхронный вызов
-        else:
-            asyncio.run(self.async_shutdown())  # Запуск нового event loop
+            # Обработчик закрытия окна
+            def on_close(event):
+                if hasattr(self, 'ani') and self.ani is not None:
+                    self.ani.event_source.stop()
+                plt.close('all')
+                self.stop_event.set()
+
+            self.fig.canvas.mpl_connect("close_event", on_close)
+            plt.show(block=True)  # Блокирующий вызов
+
+        except Exception as e:
+            logging.error(f"Ошибка запуска GUI: {e}")
+        finally:
+            self._cleanup()
+
+    def _cleanup(self):
+        """Очистка ресурсов"""
+        if hasattr(self, 'ani'):
+            self.ani = None
+        plt.close('all')
+        self.stop_event.set()
+
+        # Закрытие соединений с БД
+        if hasattr(self, 'conn'):
+            self.conn.close()
+        if hasattr(self, 'temp_conn'):
+            self.temp_conn.close()
+
+        # Отмена асинхронных задач
+        try:
+            loop = asyncio.get_event_loop()
+            for task in asyncio.all_tasks(loop):
+                task.cancel()
+        except RuntimeError:
+            pass
+
+    def shutdown(self):
+        """Полное завершение работы"""
+        self.stop_event.set()
+        self.stop_bot()  # Останавливаем бот корректно
+
+        # Закрываем все соединения с БД
+        if hasattr(self, 'conn'):
+            self.conn.close()
+        if hasattr(self, 'temp_conn'):
+            self.temp_conn.close()
+
+        # Принудительное завершение matplotlib
+        import matplotlib.pyplot as plt
+        plt.close('all')
 
     async def async_shutdown(self):
         """Асинхронное завершение операций перед выходом."""
