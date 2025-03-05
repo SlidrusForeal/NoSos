@@ -1,24 +1,21 @@
-import os
-import sqlite3
+import asyncio
+import logging
 import queue
+import sqlite3
 import threading
 import time
-import logging
 from collections import defaultdict, deque
 from datetime import datetime
+
 import matplotlib
 import matplotlib.pyplot as plt
 import pandas as pd
 import requests
-import tempfile
-import re
-import asyncio
-
 from alerts.manager import AlertManager
 from bot.telegram_bot import TelegramBot
-from security.security_manager import SecurityManager
 from db.database import get_connection, create_tables
-from utils.helpers import clean_html_tags
+from security.security_manager import SecurityManager
+
 
 class NOSOS:
     def __init__(self, config):
@@ -68,6 +65,7 @@ class NOSOS:
                     time.sleep(3600)
                 except Exception as e:
                     logging.error(f"Cleanup error: {e}")
+
         threading.Thread(target=cleanup_worker, daemon=True).start()
 
     def send_notifications(self, alert):
@@ -180,6 +178,7 @@ class NOSOS:
                         task()
                 except Exception:
                     continue
+
         threading.Thread(target=handler, daemon=True).start()
 
     def process_player_movements(self, players):
@@ -293,7 +292,8 @@ class NOSOS:
     def setup_controls(self):
         self.player_list_ax = self.fig.add_axes([0.72, 0.25, 0.25, 0.70])
         self.player_list_ax.axis('off')
-        self.player_list_text = self.player_list_ax.text(0.05, 0.95, "Обновление...", fontfamily='monospace', verticalalignment='top', color='white', fontsize=9)
+        self.player_list_text = self.player_list_ax.text(0.05, 0.95, "Обновление...", fontfamily='monospace',
+                                                         verticalalignment='top', color='white', fontsize=9)
 
     def init_data_structures(self):
         self.current_data = []
@@ -314,6 +314,7 @@ class NOSOS:
                         task()
                 except Exception:
                     continue
+
         threading.Thread(target=db_handler, daemon=True).start()
 
     def save_to_db(self):
@@ -336,6 +337,7 @@ class NOSOS:
                 self.conn.commit()
             except Exception as e:
                 logging.error(f"Database error: {e}")
+
         self.db_queue.put(db_task)
 
     def load_translations(self):
@@ -398,7 +400,8 @@ class NOSOS:
         cache_key = (x, z, zone['name'])
         if cache_key in self.zone_cache:
             return self.zone_cache[cache_key]
-        in_zone = (zone["bounds"]["xmin"] <= x <= zone["bounds"]["xmax"] and zone["bounds"]["zmin"] <= z <= zone["bounds"]["zmax"])
+        in_zone = (zone["bounds"]["xmin"] <= x <= zone["bounds"]["xmax"] and zone["bounds"]["zmin"] <= z <=
+                   zone["bounds"]["zmax"])
         self.zone_cache[cache_key] = in_zone
         return in_zone
 
@@ -614,50 +617,61 @@ class NOSOS:
         from matplotlib.animation import FuncAnimation
 
         try:
-            # Инициализация анимации
+            # Инициализация анимации с проверкой
             self.ani = FuncAnimation(
                 self.fig,
                 self.update_plot,
                 interval=2000,
                 cache_frame_data=False,
-                init_func=lambda: None  # Добавляем пустую функцию инициализации
-            )
+                init_func=lambda: None
+            ) if not self.stop_event.is_set() else None  # Добавлено условие
 
-            # Обработчик закрытия окна
-            def on_close(event):
-                if hasattr(self, 'ani') and self.ani is not None:
-                    self.ani.event_source.stop()
-                plt.close('all')
-                self.stop_event.set()
-
-            self.fig.canvas.mpl_connect("close_event", on_close)
-            plt.show(block=True)  # Блокирующий вызов
+            # Регистрация обработчика закрытия
+            self.fig.canvas.mpl_connect("close_event", self.on_close)
+            plt.show()
 
         except Exception as e:
-            logging.error(f"Ошибка запуска GUI: {e}")
+            logging.error(f"Ошибка GUI: {e}")
         finally:
-            self._cleanup()
+            self.shutdown()
+
+            # Обработчик закрытия окна
+
+    def on_close(self, event):
+        """Безопасная обработка закрытия окна"""
+        try:
+            # Проверяем существование анимации и event_source
+            if hasattr(self, 'ani') and self.ani is not None:
+                if hasattr(self.ani, 'event_source') and self.ani.event_source:
+                    self.ani.event_source.stop()
+
+                    # Останавливаем все потоки
+                    self.stop_event.set()
+
+                    # Закрываем соединения с БД
+                    self._cleanup()
+
+        except Exception as e:
+            logging.error(f"Ошибка при закрытии: {e}")
+        finally:
+            import matplotlib.pyplot as plt
+            plt.close('all')  # Принудительно закрываем все фигуры
 
     def _cleanup(self):
         """Очистка ресурсов"""
-        if hasattr(self, 'ani'):
-            self.ani = None
-        plt.close('all')
-        self.stop_event.set()
-
-        # Закрытие соединений с БД
-        if hasattr(self, 'conn'):
-            self.conn.close()
-        if hasattr(self, 'temp_conn'):
-            self.temp_conn.close()
-
-        # Отмена асинхронных задач
         try:
-            loop = asyncio.get_event_loop()
-            for task in asyncio.all_tasks(loop):
-                task.cancel()
-        except RuntimeError:
-            pass
+            # Безопасная остановка анимации
+            if hasattr(self, 'ani') and self.ani is not None:
+                self.ani = None  # Явный сброс ссылки
+
+            # Закрытие соединений с БД
+            if hasattr(self, 'conn'):
+                self.conn.close()
+            if hasattr(self, 'temp_conn'):
+                self.temp_conn.close()
+
+        except Exception as e:
+            logging.error(f"Ошибка очистки: {e}")
 
     def shutdown(self):
         """Полное завершение работы"""
@@ -673,6 +687,7 @@ class NOSOS:
         # Принудительное завершение matplotlib
         import matplotlib.pyplot as plt
         plt.close('all')
+        self._cleanup()
 
     async def async_shutdown(self):
         """Асинхронное завершение операций перед выходом."""
@@ -698,4 +713,3 @@ class NOSOS:
             self.player_time = defaultdict(int)
 
         return sorted(self.player_time.items(), key=lambda x: x[1], reverse=True)[:top_n]
-
